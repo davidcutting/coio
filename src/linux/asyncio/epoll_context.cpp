@@ -5,22 +5,22 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/stat.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <mutex>
+#include <ranges>
+#include <utility>
 #include <coio/asyncio/epoll_context.h>
 #include "../common.h"
 
 namespace coio {
     namespace detail {
-        namespace {
-            constexpr int epoll_max_wait_count = 128;
-        }
-
         reactor_interrupter::reactor_interrupter() {
             reader_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-            if (reader_ != -1) [[likely]] {
-                writer_ = reader_;
-                return;
-            }
-            // fallback: use pipe
+            if (reader_ != -1) [[likely]] { writer_ = reader_; return; }
             int pipedes[2];
             detail::throw_last_error(::pipe2(pipedes, O_CLOEXEC | O_NONBLOCK));
             reader_ = pipedes[0];
@@ -29,9 +29,7 @@ namespace coio {
 
         reactor_interrupter::~reactor_interrupter() {
             no_errno_here(::close(reader_));
-            if (writer_ != reader_) [[unlikely]] {
-                no_errno_here(::close(writer_));
-            }
+            if (writer_ != reader_) [[unlikely]] no_errno_here(::close(writer_));
         }
 
         auto reactor_interrupter::interrupt() -> void {
@@ -44,14 +42,10 @@ namespace coio {
                 while (true) {
                     std::uint64_t data;
                     const auto n = ::read(reader_, &data, sizeof(data));
-                    if (n < 0) [[unlikely]] {
-                        if (errno == EINTR) continue;
-                        return false;
-                    }
+                    if (n < 0) [[unlikely]] { if (errno == EINTR) continue; return false; }
                     return true;
                 }
             }
-
             std::byte buffer[1024];
             while (true) {
                 ssize_t bytes_read = ::read(reader_, buffer, sizeof(buffer));
@@ -63,615 +57,303 @@ namespace coio {
                 return false;
             }
         }
+
+        auto epoll_prepare_fd(int fd) -> void {
+            if (fd == -1) return;
+            struct ::stat st{};
+            if (::fstat(fd, &st) == -1) [[unlikely]] throw std::system_error{errno, std::system_category(), "fstat"};
+            if (S_ISREG(st.st_mode) or S_ISDIR(st.st_mode)) [[unlikely]] {
+                throw std::system_error{std::make_error_code(std::errc::operation_not_permitted), "the target file `fd` doesn't support epoll"};
+            }
+            const int flags = ::fcntl(fd, F_GETFL);
+            if (flags == -1) [[unlikely]] throw std::system_error{errno, std::system_category(), "fcntl(fd, F_GETFL)"};
+            if ((flags & O_NONBLOCK) == 0) {
+                if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) [[unlikely]] {
+                    throw std::system_error{errno, std::system_category(), "fcntl(fd, F_SETFL, ...)"};
+                }
+            }
+        }
+
+        auto epoll_arm_timerfd(std::chrono::steady_clock::time_point deadline) noexcept -> int {
+            const int fd = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+            if (fd == -1) return -1;
+            const auto d = deadline.time_since_epoch(); // steady_clock == CLOCK_MONOTONIC on Linux
+            const auto secs = std::chrono::duration_cast<std::chrono::seconds>(d);
+            ::itimerspec its{};
+            its.it_value.tv_sec = secs.count();
+            its.it_value.tv_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(d - secs).count();
+            // an all-zero it_value means "disarm"; a real deadline is never the epoch, but guard anyway.
+            if (its.it_value.tv_sec == 0 and its.it_value.tv_nsec == 0) its.it_value.tv_nsec = 1;
+            if (::timerfd_settime(fd, TFD_TIMER_ABSTIME, &its, nullptr) == -1) { ::close(fd); return -1; }
+            return fd;
+        }
+
+        auto epoll_drain_timerfd(int fd) noexcept -> void {
+            std::uint64_t expirations = 0;
+            static_cast<void>(::read(fd, &expirations, sizeof(expirations)));
+        }
+
+        auto epoll_close_timer(int epoll_fd, int fd) noexcept -> void {
+            static_cast<void>(::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr));
+            static_cast<void>(::close(fd));
+        }
     }
 
-    auto epoll_context::epoll_node::register_event(int event_type, std::uint32_t extra_flags) noexcept -> bool {
+    auto epoll_driver::operation::register_event(int event_type, std::uint32_t extra_flags) noexcept -> bool {
         std::scoped_lock _{data->fd_lock};
         const bool in_op_registered = data->in_op;
         const bool out_op_registered = data->out_op;
-        if (event_type == EPOLLIN /* or event_type == EPOLLPRI */) {
-            COIO_ASSERT(not in_op_registered && "an asynchronous input operation shall be initiated after another input operation has completed.");
+        if (event_type == EPOLLIN) {
+            COIO_ASSERT(not in_op_registered && "input op initiated before a prior input op completed.");
         }
         else if (event_type == EPOLLOUT) {
-            COIO_ASSERT(not out_op_registered && "an asynchronous output operation shall be initiated after another output operation has completed.");
+            COIO_ASSERT(not out_op_registered && "output op initiated before a prior output op completed.");
         }
         else unreachable();
 
         std::uint32_t ev = event_type | extra_flags;
         int epoll_ctl_op = data->events == 0 ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
-
-        if (in_op_registered) {
-            ev |= EPOLLIN;
-            epoll_ctl_op = EPOLL_CTL_MOD;
-        }
-        if (out_op_registered) {
-            ev |= EPOLLOUT;
-            epoll_ctl_op = EPOLL_CTL_MOD;
-        }
+        if (in_op_registered) { ev |= EPOLLIN; epoll_ctl_op = EPOLL_CTL_MOD; }
+        if (out_op_registered) { ev |= EPOLLOUT; epoll_ctl_op = EPOLL_CTL_MOD; }
 
         bool ok = ev == data->events;
         if (not ok) {
             ::epoll_event event{.events = ev, .data = {.ptr = data}};
-            ok = ::epoll_ctl(context_.epoll_fd_, epoll_ctl_op, fd, &event) == 0;
+            ok = ::epoll_ctl(driver_.epoll_fd_, epoll_ctl_op, fd, &event) == 0;
         }
         if (ok) [[likely]] {
             data->events = ev;
-            if (event_type == EPOLLIN /* or event_type == EPOLLPRI */) {
-                data->in_op = this;
-            }
-            else if (event_type == EPOLLOUT) {
-                data->out_op = this;
-            }
+            if (event_type == EPOLLIN) data->in_op = this;
+            else if (event_type == EPOLLOUT) data->out_op = this;
         }
         return ok;
     }
 
+    epoll_driver::epoll_driver(std::pmr::memory_resource& mr) : allocator_(&mr) {
+        epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
+        detail::throw_last_error(epoll_fd_);
+        ::epoll_event event{.events = std::uint32_t(EPOLLIN | EPOLLET), .data = {.ptr = &interrupter_}};
+        detail::throw_last_error(::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, interrupter_.watcher(), &event));
+    }
 
-    epoll_context::scheduler::io_object::io_object(
-        std::nullptr_t, epoll_context& ctx, int fd
-    ) : ctx_(ctx), fd_(fd), data_(ctx.new_epoll_data()) {}
+    epoll_driver::~epoll_driver() { ::close(epoll_fd_); }
 
-    epoll_context::scheduler::io_object::io_object(epoll_context& ctx, int fd) : io_object(nullptr, ctx, fd) {
-        if (fd == -1) return;
-        struct ::stat st{};
-        if (::fstat(fd, &st) == -1) [[unlikely]] {
-            throw std::system_error{errno, std::system_category(), "fstat"};
-        }
-        if (S_ISREG(st.st_mode) or S_ISDIR(st.st_mode)) [[unlikely]] {
-            throw std::system_error{
-                std::make_error_code(std::errc::operation_not_permitted),
-                "the target file `fd` doesn't support epoll"
+    auto epoll_driver::process_ready(detail::ready_queue& ready) -> void {
+        if (event_count_ <= 0) { event_count_ = 0; return; }
+        for (int i = 0; i < event_count_; ++i) {
+            const auto& [event, data] = events_[i];
+            COIO_ASSERT(data.ptr != nullptr);
+            if (data.ptr == &interrupter_) { interrupter_.reset(); continue; }
+            const auto fd_data = static_cast<per_fd_data*>(data.ptr);
+            std::scoped_lock _{fd_data->fd_lock};
+            std::array ops{
+                std::pair{EPOLLIN, std::ref(fd_data->in_op)},
+                std::pair{EPOLLOUT, std::ref(fd_data->out_op)}
             };
-        }
-        const int flags = ::fcntl(fd, F_GETFL);
-        if (flags == -1) [[unlikely]] {
-            throw std::system_error{errno, std::system_category(), "fcntl(fd, F_GETFL)"};
-        }
-        if ((flags & O_NONBLOCK) == 0) {
-            if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) [[unlikely]] {
-                throw std::system_error{errno, std::system_category(), "fcntl(fd, F_SETFL, ...)"};
-            }
-        }
-    }
-
-    epoll_context::scheduler::io_object::~io_object() {
-        cancel();
-        ctx_.get().reclaim_epoll_data(data_);
-    }
-
-    auto epoll_context::scheduler::io_object::release() -> int {
-        if (fd_ == -1) return -1;
-        COIO_ASSERT(data_ != nullptr);
-        epoll_context& context = ctx_;
-        cancel();
-        {
-            // Single-owner: EPOLL_CTL_DEL runs on the owner thread (no concurrent poller), so only the
-            // per-fd lock is needed to serialise against a cross-thread cancel touching in_op/out_op.
-            std::scoped_lock _{data_->fd_lock};
-            if (data_->events != 0) {
-                detail::throw_last_error(::epoll_ctl(context.epoll_fd_, EPOLL_CTL_DEL, fd_, nullptr));
-            }
-        }
-        ctx_.get().reclaim_epoll_data(std::exchange(data_, nullptr));
-        return std::exchange(fd_, -1);
-    }
-
-    auto epoll_context::scheduler::io_object::cancel() -> void {
-        if (fd_ == -1) return;
-        COIO_ASSERT(data_ != nullptr);
-        auto& context = ctx_.get();
-        const auto ops = [this]{
-            std::scoped_lock _{data_->fd_lock};
-            return std::array{
-                std::exchange(data_->in_op, nullptr),
-                std::exchange(data_->out_op, nullptr)
-            };
-        }();
-        for (auto* op : ops) {
-            if (op != nullptr) context.post_node(*op);
-        }
-    }
-
-    epoll_context::epoll_context(std::pmr::memory_resource& memory_resource): epoll_context(nullptr, memory_resource) {
-        {
-            epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
-            detail::throw_last_error(epoll_fd_);
-        }
-        {
-            ::epoll_event event {
-                .events = std::uint32_t(EPOLLIN | EPOLLET),
-                .data = {.ptr = &interrupter_}
-            };
-            detail::throw_last_error(::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, interrupter_.watcher(), &event));
-        }
-        lockfree_inject_ = true;
-        park_aware_ = true;
-    }
-
-    epoll_context::~epoll_context() {
-        request_stop();
-        ::close(epoll_fd_);
-    }
-
-    auto epoll_context::do_one(bool infinite) -> bool {
-        if (owner_.load(std::memory_order_relaxed) == std::thread::id{}) [[unlikely]] {
-            owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
-        }
-        if (work_count_ == 0) return false;
-
-        ::epoll_event ready_events[detail::epoll_max_wait_count];
-        for (;;) {
-            drain_inject();
-            timer_queue_.take_ready_timers(local_queue_);
-
-            if (auto* op = local_queue_.pop_front()) {
-                op->finish();
-                return true;
-            }
-            if (work_count_ == 0) return false;
-
-            if (infinite) {
-                // Park protocol (see loop_base::notify): publish that we are about to block, then
-                // re-check the sources a producer may have filled after the checks above. If we find
-                // work, unpublish and handle it; otherwise block with parked_ set so a concurrent
-                // producer sees it and writes the interrupter eventfd.
-                parked_.store(true, std::memory_order_relaxed);
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-                drain_inject();
-                timer_queue_.take_ready_timers(local_queue_);
-                if (auto* op = local_queue_.pop_front()) {
-                    parked_.store(false, std::memory_order_relaxed);
-                    op->finish();
-                    return true;
+            for (auto [ev, op_ref] : ops) {
+                auto& op = op_ref.get();
+                if (event & (ev | EPOLLERR | EPOLLHUP)) {
+                    if (op == nullptr or not op->perform()) continue;
+                    ready.push_back(*op);
+                    op = nullptr;
                 }
             }
-
-            int timeout = infinite ? -1 : 0;
-            if (infinite) {
-                using milliseconds = std::chrono::duration<int, std::milli>;
-                if (const auto earliest = timer_queue_.earliest()) {
-                    const auto now = std::chrono::steady_clock::now();
-                    const auto msec = std::chrono::duration_cast<milliseconds>(*earliest - now).count();
-                    timeout = std::max(msec, 0);
-                    if (timeout > 0) timeout += 1;
-                }
-            }
-            const int ready_count = ::epoll_wait(epoll_fd_, ready_events, detail::epoll_max_wait_count, timeout);
-            parked_.store(false, std::memory_order_relaxed);
-            if (ready_count == -1 and errno == EINTR) continue;
-            detail::throw_last_error(ready_count, "epoll_wait");
-
-            for (int i = 0; i < ready_count; ++i) {
-                const auto& [event, data] = ready_events[i];
-                COIO_ASSERT(data.ptr != nullptr);
-                if (data.ptr == &interrupter_) {
-                    interrupter_.reset();
-                    continue;
-                }
-
-                const auto fd_data = static_cast<per_fd_data*>(data.ptr);
-                std::scoped_lock _{fd_data->fd_lock};
-                std::array ops{
-                    std::pair{EPOLLIN, std::ref(fd_data->in_op)},
-                    std::pair{EPOLLOUT, std::ref(fd_data->out_op)}
-                    // TODO: handle EPOLLPRI for out-of-band data
-                };
-                for (auto [ev, op_ref] : ops) {
-                    auto& op = op_ref.get();
-                    if (event & (ev | EPOLLERR | EPOLLHUP)) {
-                        if (op == nullptr or not op->perform()) continue;
-                        local_queue_.push_back(*op);
-                        op = nullptr;
-                    }
-                }
-            }
-
-            if (not infinite) {
-                drain_inject();
-                timer_queue_.take_ready_timers(local_queue_);
-                if (auto* op = local_queue_.pop_front()) {
-                    op->finish();
-                    return true;
-                }
-                return false;
-            }
         }
+        event_count_ = 0;
     }
 
-    auto epoll_context::new_epoll_data() -> per_fd_data* {
-        return allocator_.new_object<per_fd_data>();
+    auto epoll_driver::poll(detail::ready_queue& ready, std::size_t /*batch*/) -> void {
+        process_ready(ready); // drain events buffered by a prior poll_wait()
+        event_count_ = ::epoll_wait(epoll_fd_, events_, static_cast<int>(std::ranges::size(events_)), 0);
+        if (event_count_ == -1) {
+            event_count_ = 0;
+            if (errno != EINTR) detail::throw_last_error(-1, "epoll_wait");
+        }
+        process_ready(ready);
     }
 
-    auto epoll_context::reclaim_epoll_data(per_fd_data* data) noexcept -> void {
-        if (data == nullptr) return;
-        return allocator_.delete_object(data);
+    auto epoll_driver::poll_wait() -> void {
+        do {
+            event_count_ = ::epoll_wait(epoll_fd_, events_, static_cast<int>(std::ranges::size(events_)), -1);
+        } while (event_count_ == -1 and errno == EINTR);
+        if (event_count_ == -1) detail::throw_last_error(-1, "epoll_wait");
+        // leave the events buffered; the next poll() drains them into the executor's run queue
     }
 
-    auto epoll_context::cancel_op(int event, epoll_node* op) -> void {
+    auto epoll_driver::cancel_op(int event, operation* op) -> void {
         COIO_ASSERT(op != nullptr and op->data != nullptr);
         std::unique_lock fd_lock{op->data->fd_lock};
-        const auto registered_op = event == EPOLLIN ?
-            std::exchange(op->data->in_op, nullptr) :
-            std::exchange(op->data->out_op, nullptr);
-
+        const auto registered_op = event == EPOLLIN
+            ? std::exchange(op->data->in_op, nullptr)
+            : std::exchange(op->data->out_op, nullptr);
         if (registered_op != nullptr) {
-            COIO_ASSERT(op == registered_op);  // if there is a registered operation, it shall be `op`
+            COIO_ASSERT(op == registered_op);
             fd_lock.unlock();
             op->immediately_post();
         }
     }
 
+    auto epoll_driver::cancel_all(per_fd_data* data) -> void {
+        if (data == nullptr) return;
+        const auto ops = [&] {
+            std::scoped_lock _{data->fd_lock};
+            return std::array{std::exchange(data->in_op, nullptr), std::exchange(data->out_op, nullptr)};
+        }();
+        for (auto* op : ops) if (op != nullptr) op->immediately_post();
+    }
+
+    auto epoll_driver::release_fd(int fd, per_fd_data* data) -> void {
+        if (data == nullptr) return;
+        std::scoped_lock _{data->fd_lock};
+        if (data->events != 0) {
+            detail::throw_last_error(::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr));
+        }
+    }
+
     namespace detail {
-        /// async_read_some
-        template<>
-        auto epoll_state_base_for<async_read_some_t>::do_start() noexcept -> bool {
-            if (fd == -1) [[unlikely]] {
-                result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
-                return false;
-            }
-            if (buffer.empty()) [[unlikely]] {
-                result.set_value(0);
-                immediately_post();
-                return true;
-            }
-            if (not register_event(EPOLLIN, 0)) [[unlikely]] {
-                result.set_error(std::error_code{errno, std::system_category()});
-                return false;
-            }
+        template<> auto epoll_state_base_for<async_read_some_t>::do_start() noexcept -> bool {
+            if (fd == -1) [[unlikely]] { result.set_error(std::make_error_code(std::errc::bad_file_descriptor)); return false; }
+            if (buffer.empty()) [[unlikely]] { result.set_value(0); immediately_post(); return true; }
+            if (not register_event(EPOLLIN, 0)) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; }
             return true;
         }
-
-        template<>
-        auto epoll_state_base_for<async_read_some_t>::do_perform() noexcept -> bool {
+        template<> auto epoll_state_base_for<async_read_some_t>::do_perform() noexcept -> bool {
             const ::ssize_t n = ::read(fd, buffer.data(), buffer.size());
-            if (n == -1) {
-                if (is_blocking_errno(errno)) [[unlikely]] {
-                    return false;
-                }
-                result.set_error(std::error_code{errno, std::system_category()});
-            }
-            else {
-                result.set_value(n);
-            }
+            if (n == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
+            else result.set_value(n);
             return true;
         }
+        template<> auto epoll_state_base_for<async_read_some_t>::do_cancel() -> void { driver_.cancel_op(EPOLLIN, this); }
 
-        template<>
-        auto epoll_state_base_for<async_read_some_t>::do_cancel() -> void {
-            context_.cancel_op(EPOLLIN, this);
-        }
-
-
-        /// async_write_some
-        template<>
-        auto epoll_state_base_for<async_write_some_t>::do_start() noexcept -> bool {
-            if (fd == -1) [[unlikely]] {
-                result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
-                return false;
-            }
-            if (buffer.empty()) [[unlikely]] {
-                result.set_value(0);
-                immediately_post();
-                return true;
-            }
-            if (not register_event(EPOLLOUT, 0)) [[unlikely]] {
-                result.set_error(std::error_code{errno, std::system_category()});
-                return false;
-            }
+        template<> auto epoll_state_base_for<async_write_some_t>::do_start() noexcept -> bool {
+            if (fd == -1) [[unlikely]] { result.set_error(std::make_error_code(std::errc::bad_file_descriptor)); return false; }
+            if (buffer.empty()) [[unlikely]] { result.set_value(0); immediately_post(); return true; }
+            if (not register_event(EPOLLOUT, 0)) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; }
             return true;
         }
-
-        template<>
-        auto epoll_state_base_for<async_write_some_t>::do_perform() noexcept -> bool {
+        template<> auto epoll_state_base_for<async_write_some_t>::do_perform() noexcept -> bool {
             const ::ssize_t n = ::write(fd, buffer.data(), buffer.size());
-            if (n == -1) {
-                if (is_blocking_errno(errno)) [[unlikely]] {
-                    return false;
-                }
-                result.set_error(std::error_code{errno, std::system_category()});
-            }
-            else {
-                result.set_value(n);
-            }
+            if (n == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
+            else result.set_value(n);
             return true;
         }
+        template<> auto epoll_state_base_for<async_write_some_t>::do_cancel() -> void { driver_.cancel_op(EPOLLOUT, this); }
 
-        template<>
-        auto epoll_state_base_for<async_write_some_t>::do_cancel() -> void {
-            context_.cancel_op(EPOLLOUT, this);
-        }
-
-
-        /// async_receive
-        template<>
-        auto epoll_state_base_for<async_receive_t>::do_start() noexcept -> bool {
-            if (fd == -1) [[unlikely]] {
-                result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
-                return false;
-            }
+        template<> auto epoll_state_base_for<async_receive_t>::do_start() noexcept -> bool {
+            if (fd == -1) [[unlikely]] { result.set_error(std::make_error_code(std::errc::bad_file_descriptor)); return false; }
             const ::ssize_t n = ::recv(fd, buffer.data(), buffer.size(), MSG_DONTWAIT);
             if (n == -1) {
-                if (is_blocking_errno(errno)) {
-                    if (not register_event(EPOLLIN, EPOLLET)) [[unlikely]] {
-                        result.set_error(std::error_code{errno, std::system_category()});
-                        return false;
-                    }
-                    return true;
-                }
-                result.set_error(std::error_code{errno, std::system_category()});
-                return false;
+                if (is_blocking_errno(errno)) { if (not register_event(EPOLLIN, EPOLLET)) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; } return true; }
+                result.set_error(std::error_code{errno, std::system_category()}); return false;
             }
-            result.set_value(n);
-            immediately_post();
-            return true;
+            result.set_value(n); immediately_post(); return true;
         }
-
-        template<>
-        auto epoll_state_base_for<async_receive_t>::do_perform() noexcept -> bool {
+        template<> auto epoll_state_base_for<async_receive_t>::do_perform() noexcept -> bool {
             const ::ssize_t n = ::recv(fd, buffer.data(), buffer.size(), MSG_DONTWAIT);
-            if (n == -1) {
-                if (is_blocking_errno(errno)) [[unlikely]] {
-                    return false;
-                }
-                result.set_error(std::error_code{errno, std::system_category()});
-            }
-            else {
-                result.set_value(n);
-            }
+            if (n == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
+            else result.set_value(n);
             return true;
         }
+        template<> auto epoll_state_base_for<async_receive_t>::do_cancel() -> void { driver_.cancel_op(EPOLLIN, this); }
 
-        template<>
-        auto epoll_state_base_for<async_receive_t>::do_cancel() -> void {
-            context_.cancel_op(EPOLLIN, this);
-        }
-
-
-        /// async_send
-        template<>
-        auto epoll_state_base_for<async_send_t>::do_start() noexcept -> bool {
-            if (fd == -1) [[unlikely]] {
-                result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
-                return false;
-            }
+        template<> auto epoll_state_base_for<async_send_t>::do_start() noexcept -> bool {
+            if (fd == -1) [[unlikely]] { result.set_error(std::make_error_code(std::errc::bad_file_descriptor)); return false; }
             const ::ssize_t n = ::send(fd, buffer.data(), buffer.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
             if (n == -1) {
-                if (is_blocking_errno(errno)) {
-                    if (not register_event(EPOLLOUT, EPOLLET)) [[unlikely]] {
-                        result.set_error(std::error_code{errno, std::system_category()});
-                        return false;
-                    }
-                    return true;
-                }
-                result.set_error(std::error_code{errno, std::system_category()});
-                return false;
+                if (is_blocking_errno(errno)) { if (not register_event(EPOLLOUT, EPOLLET)) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; } return true; }
+                result.set_error(std::error_code{errno, std::system_category()}); return false;
             }
-            result.set_value(n);
-            immediately_post();
-            return true;
+            result.set_value(n); immediately_post(); return true;
         }
-
-        template<>
-        auto epoll_state_base_for<async_send_t>::do_perform() noexcept -> bool {
+        template<> auto epoll_state_base_for<async_send_t>::do_perform() noexcept -> bool {
             const ::ssize_t n = ::send(fd, buffer.data(), buffer.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
-            if (n == -1) {
-                if (is_blocking_errno(errno)) [[unlikely]] {
-                    return false;
-                }
-                result.set_error(std::error_code{errno, std::system_category()});
-            }
-            else {
-                result.set_value(n);
-            }
+            if (n == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
+            else result.set_value(n);
             return true;
         }
+        template<> auto epoll_state_base_for<async_send_t>::do_cancel() -> void { driver_.cancel_op(EPOLLOUT, this); }
 
-        template<>
-        auto epoll_state_base_for<async_send_t>::do_cancel() -> void {
-            context_.cancel_op(EPOLLOUT, this);
-        }
-
-
-        /// async_receive_from
-        template<>
-        auto epoll_state_base_for<async_receive_from_t>::do_start() noexcept -> bool {
-            if (fd == -1) [[unlikely]] {
-                result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
-                return false;
-            }
+        template<> auto epoll_state_base_for<async_receive_from_t>::do_start() noexcept -> bool {
+            if (fd == -1) [[unlikely]] { result.set_error(std::make_error_code(std::errc::bad_file_descriptor)); return false; }
             ::socklen_t len = sizeof(peer);
-            const ::ssize_t n = ::recvfrom(
-                fd, buffer.data(), buffer.size(), MSG_DONTWAIT,
-                reinterpret_cast<::sockaddr*>(&peer), &len
-            );
+            const ::ssize_t n = ::recvfrom(fd, buffer.data(), buffer.size(), MSG_DONTWAIT, reinterpret_cast<::sockaddr*>(&peer), &len);
             if (n == -1) {
-                if (is_blocking_errno(errno)) {
-                    if (not register_event(EPOLLIN, EPOLLET)) [[unlikely]] {
-                        result.set_error(std::error_code{errno, std::system_category()});
-                        return false;
-                    }
-                    return true;
-                }
-                result.set_error(std::error_code{errno, std::system_category()});
-                return false;
+                if (is_blocking_errno(errno)) { if (not register_event(EPOLLIN, EPOLLET)) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; } return true; }
+                result.set_error(std::error_code{errno, std::system_category()}); return false;
             }
-            result.set_value(sockaddr_storage_to_endpoint(peer), n);
-            immediately_post();
-            return true;
+            result.set_value(sockaddr_storage_to_endpoint(peer), n); immediately_post(); return true;
         }
-
-        template<>
-        auto epoll_state_base_for<async_receive_from_t>::do_perform() noexcept -> bool {
+        template<> auto epoll_state_base_for<async_receive_from_t>::do_perform() noexcept -> bool {
             ::socklen_t len = sizeof(peer);
-            const ::ssize_t n = ::recvfrom(
-                fd, buffer.data(), buffer.size(), MSG_DONTWAIT,
-                reinterpret_cast<::sockaddr*>(&peer), &len
-            );
-            if (n == -1) {
-                if (is_blocking_errno(errno)) [[unlikely]] {
-                    return false;
-                }
-                result.set_error(std::error_code{errno, std::system_category()});
-            }
-            else {
-                result.set_value(sockaddr_storage_to_endpoint(peer), n);
-            }
+            const ::ssize_t n = ::recvfrom(fd, buffer.data(), buffer.size(), MSG_DONTWAIT, reinterpret_cast<::sockaddr*>(&peer), &len);
+            if (n == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
+            else result.set_value(sockaddr_storage_to_endpoint(peer), n);
             return true;
         }
+        template<> auto epoll_state_base_for<async_receive_from_t>::do_cancel() -> void { driver_.cancel_op(EPOLLIN, this); }
 
-        template<>
-        auto epoll_state_base_for<async_receive_from_t>::do_cancel() -> void {
-            context_.cancel_op(EPOLLIN, this);
-        }
-
-
-        /// async_send_to
-        template<>
-        auto epoll_state_base_for<async_send_to_t>::do_start() noexcept -> bool {
-            if (fd == -1) [[unlikely]] {
-                result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
-                return false;
-            }
+        template<> auto epoll_state_base_for<async_send_to_t>::do_start() noexcept -> bool {
+            if (fd == -1) [[unlikely]] { result.set_error(std::make_error_code(std::errc::bad_file_descriptor)); return false; }
             auto sa = endpoint_to_sockaddr_in(peer);
             auto [psa, len] = to_sockaddr(sa);
             ::ssize_t n = ::sendto(fd, buffer.data(), buffer.size(), MSG_DONTWAIT | MSG_NOSIGNAL, psa, len);
             if (n == -1) {
-                if (is_blocking_errno(errno)) {
-                    if (not register_event(EPOLLOUT, EPOLLET)) [[unlikely]] {
-                        result.set_error(std::error_code{errno, std::system_category()});
-                        return false;
-                    }
-                    return true;
-                }
-                result.set_error(std::error_code{errno, std::system_category()});
-                return false;
+                if (is_blocking_errno(errno)) { if (not register_event(EPOLLOUT, EPOLLET)) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; } return true; }
+                result.set_error(std::error_code{errno, std::system_category()}); return false;
             }
-            result.set_value(n);
-            immediately_post();
-            return true;
+            result.set_value(n); immediately_post(); return true;
         }
-
-        template<>
-        auto epoll_state_base_for<async_send_to_t>::do_perform() noexcept -> bool {
+        template<> auto epoll_state_base_for<async_send_to_t>::do_perform() noexcept -> bool {
             auto sa = endpoint_to_sockaddr_in(peer);
             auto [psa, len] = to_sockaddr(sa);
             ::ssize_t n = ::sendto(fd, buffer.data(), buffer.size(), MSG_DONTWAIT | MSG_NOSIGNAL, psa, len);
-            if (n == -1) {
-                if (is_blocking_errno(errno)) [[unlikely]] {
-                    return false;
-                }
-                result.set_error(std::error_code{errno, std::system_category()});
-            }
-            else {
-                result.set_value(n);
-            }
+            if (n == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
+            else result.set_value(n);
             return true;
         }
+        template<> auto epoll_state_base_for<async_send_to_t>::do_cancel() -> void { driver_.cancel_op(EPOLLOUT, this); }
 
-        template<>
-        auto epoll_state_base_for<async_send_to_t>::do_cancel() -> void {
-            context_.cancel_op(EPOLLOUT, this);
-        }
-
-
-        /// async_accept
-        template<>
-        auto epoll_state_base_for<async_accept_t>::do_start() noexcept -> bool {
-            if (fd == -1) [[unlikely]] {
-                result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
-                return false;
-            }
-            if (not register_event(EPOLLIN, 0)) [[unlikely]] {
-                result.set_error(std::error_code{errno, std::system_category()});
-                return false;
-            }
+        template<> auto epoll_state_base_for<async_accept_t>::do_start() noexcept -> bool {
+            if (fd == -1) [[unlikely]] { result.set_error(std::make_error_code(std::errc::bad_file_descriptor)); return false; }
+            if (not register_event(EPOLLIN, 0)) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; }
             return true;
         }
-
-        template<>
-        auto epoll_state_base_for<async_accept_t>::do_perform() noexcept -> bool {
+        template<> auto epoll_state_base_for<async_accept_t>::do_perform() noexcept -> bool {
             auto accepted_ = ::accept4(fd, nullptr, nullptr, SOCK_NONBLOCK);
-            if (accepted_ == -1) {
-                if (is_blocking_errno(errno)) [[unlikely]] {
-                    return false;
-                }
-                result.set_error(std::error_code{errno, std::system_category()});
-            }
-            else {
-                result.set_value(accepted_);
-            }
+            if (accepted_ == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
+            else result.set_value(accepted_);
             return true;
         }
+        template<> auto epoll_state_base_for<async_accept_t>::do_cancel() -> void { driver_.cancel_op(EPOLLIN, this); }
 
-        template<>
-        auto epoll_state_base_for<async_accept_t>::do_cancel() -> void {
-            context_.cancel_op(EPOLLIN, this);
-        }
-
-
-        /// async_connect
-        template<>
-        auto epoll_state_base_for<async_connect_t>::do_start() noexcept -> bool {
-            if (fd == -1) [[unlikely]] {
-                result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
-                return false;
-            }
+        template<> auto epoll_state_base_for<async_connect_t>::do_start() noexcept -> bool {
+            if (fd == -1) [[unlikely]] { result.set_error(std::make_error_code(std::errc::bad_file_descriptor)); return false; }
             const auto flags = ::fcntl(fd, F_GETFL);
-            if (flags == -1) [[unlikely]] {
-                result.set_error(std::error_code{errno, std::system_category()});
-                return false;
-            }
+            if (flags == -1) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; }
             if ((flags & O_NONBLOCK) == 0) {
-                if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) [[unlikely]] {
-                    result.set_error(std::error_code{errno, std::system_category()});
-                    return false;
-                }
+                if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; }
             }
             auto sa = endpoint_to_sockaddr_in(peer);
             auto [psa, len] = to_sockaddr(sa);
             const int ec = ::connect(fd, psa, len) == -1 ? errno : 0;
             if ((flags & O_NONBLOCK) == 0) {
-                if (::fcntl(fd, F_SETFL, flags) == -1) [[unlikely]] {
-                    result.set_error(std::error_code{errno, std::system_category()});
-                    return false;
-                }
+                if (::fcntl(fd, F_SETFL, flags) == -1) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; }
             }
             if (ec != 0) {
-                if (ec == EINPROGRESS or ec == EAGAIN) {
-                    if (not register_event(EPOLLOUT, 0)) [[unlikely]] {
-                        result.set_error(std::error_code{errno, std::system_category()});
-                        return false;
-                    }
-                    return true;
-                }
-                result.set_error(std::error_code{ec, std::system_category()});
-                return false;
+                if (ec == EINPROGRESS or ec == EAGAIN) { if (not register_event(EPOLLOUT, 0)) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; } return true; }
+                result.set_error(std::error_code{ec, std::system_category()}); return false;
             }
-            result.set_value();
-            immediately_post();
-            return true;
+            result.set_value(); immediately_post(); return true;
         }
-
-        template<>
-        auto epoll_state_base_for<async_connect_t>::do_perform() noexcept -> bool {
+        template<> auto epoll_state_base_for<async_connect_t>::do_perform() noexcept -> bool {
             int ec = 0;
             ::socklen_t len = sizeof(ec);
-            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &ec, &len) == -1) {
-                result.set_error(std::error_code{errno, std::system_category()});
-            }
-            else if (ec != 0) {
-                result.set_error(std::error_code{ec, std::system_category()});
-            }
-            else {
-                result.set_value();
-            }
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &ec, &len) == -1) result.set_error(std::error_code{errno, std::system_category()});
+            else if (ec != 0) result.set_error(std::error_code{ec, std::system_category()});
+            else result.set_value();
             return true;
         }
-
-        template<>
-        auto epoll_state_base_for<async_connect_t>::do_cancel() -> void {
-            context_.cancel_op(EPOLLOUT, this);
-        }
+        template<> auto epoll_state_base_for<async_connect_t>::do_cancel() -> void { driver_.cancel_op(EPOLLOUT, this); }
     }
 }
 #endif

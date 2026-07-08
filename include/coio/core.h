@@ -2,6 +2,7 @@
 #pragma once
 #include <coio/task.h> // IWYU pragma: keep
 #include <coio/execution_context.h>
+#include <coio/time_loop.h> // IWYU pragma: keep
 #include <coio/detail/execution.h>
 #include <coio/detail/atomic_intrusive_stack.h>
 #include <coio/utils/async_scope.h> // IWYU pragma: keep

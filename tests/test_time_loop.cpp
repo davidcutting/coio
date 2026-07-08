@@ -7,9 +7,9 @@
 #include <coio/execution_context.h>
 #include <coio/utils/async_scope.h>
 
-TEST_CASE("time_loop runs work posted from another thread across several concurrent runners") {
+TEST_CASE("time_loop runs work posted from other threads (single-owner runner)") {
     constexpr int n = 3000;
-    constexpr int runners = 4;
+    constexpr int runners = 1; // single-owner: one thread drives the loop; work may be posted from any thread
 
     coio::time_loop loop;
     coio::async_scope scope;
@@ -32,11 +32,11 @@ TEST_CASE("time_loop runs work posted from another thread across several concurr
     CHECK_EQ(done.load(), n);
 }
 
-TEST_CASE("time_loop accepts work posted concurrently while runners are already spinning") {
+TEST_CASE("time_loop accepts work posted concurrently while the runner is already spinning") {
     constexpr int producers = 3;
     constexpr int per_producer = 1000;
     constexpr int total = producers * per_producer;
-    constexpr int runners = 3;
+    constexpr int runners = 1; // single-owner: one runner, many cross-thread producers
 
     coio::time_loop loop;
     coio::async_scope scope;

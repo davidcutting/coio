@@ -20,7 +20,7 @@ TEST_CASE("a single-issuer worker runs operations posted to its inbox and then d
     std::vector<counting_op> pool(op_count);
     for (auto& op : pool) {
         op.counter = &counter;
-        worker.post_node(op);
+        worker.submit(op);
     }
 
     worker.run();

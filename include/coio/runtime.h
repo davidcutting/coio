@@ -20,8 +20,8 @@ namespace coio {
     concept runtime_worker = execution_context<W> and requires(W& w, detail::operation_base& op) {
         w.run();
         w.request_stop();
-        w.notify();
-        w.post_node(op); // the runtime round-robins balanced work onto each worker's own inbox
+        w.wake_up();
+        w.submit(op); // the runtime round-robins balanced work onto each worker's own inbox
     };
 
     template<typename L>
@@ -209,7 +209,7 @@ namespace coio {
         // No shared injector, no pull — the worker drains it in do_one like any cross-thread post.
         auto post(detail::operation_base& op) -> void {
             const auto i = wake_cursor_.fetch_add(1, std::memory_order_relaxed) % workers_.size();
-            workers_[i]->post_node(op);
+            workers_[i]->submit(op);
         }
 
         static auto run_worker(Worker& worker) -> void {

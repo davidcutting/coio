@@ -18,12 +18,12 @@ namespace {
         auto work_started() noexcept -> void { ++work_count_; }
         auto work_finished() noexcept -> void { --work_count_; }
 
-        auto post_node(coio::detail::operation_base& op) noexcept -> void {
+        auto submit(coio::detail::operation_base& op) noexcept -> void {
             { std::scoped_lock lk{mtx_}; inbox_.push_back(&op); }
             cv_.notify_one();
         }
 
-        auto notify() noexcept -> void {
+        auto wake_up() noexcept -> void {
             { std::scoped_lock lk{mtx_}; notified_ = true; }
             cv_.notify_one();
         }

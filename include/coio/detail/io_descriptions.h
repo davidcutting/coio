@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include <chrono>
 #include <coio/detail/execution.h>
 #include <coio/net/basic.h>
 
@@ -53,5 +54,12 @@ namespace coio::detail {
     struct async_connect_t {
         using value_signature = execution::set_value_t();
         endpoint peer;
+    };
+
+    // A1: a timer is just an io op. On io_uring its prepare() emits an IORING_OP_TIMEOUT SQE, so it
+    // reaps and cancels through the same machinery as every other op — no separate timer subsystem.
+    struct async_sleep_t {
+        using value_signature = execution::set_value_t();
+        std::chrono::steady_clock::time_point deadline;
     };
 }

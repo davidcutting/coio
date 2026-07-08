@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <memory>
+#include <utility>
 #include <coio/asyncio/uring_context.h>
 #include <coio/runtime.h>
 
@@ -14,7 +15,7 @@ namespace coio {
             Launcher launch = {}
         ) : basic_runtime<uring_context>(
                 workers,
-                [entries](std::size_t) { return std::make_unique<uring_context>(entries); },
+                [entries](std::size_t) { return std::make_unique<uring_context>(std::in_place, entries); },
                 std::move(launch)
             ) {}
     };

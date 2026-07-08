@@ -1,20 +1,19 @@
-﻿// ReSharper disable CppPolymorphicClassWithNonVirtualPublicDestructor
+// ReSharper disable CppPolymorphicClassWithNonVirtualPublicDestructor
 // ReSharper disable CppRedundantTypenameKeyword
 #pragma once
 #include <atomic>
-#include <chrono>
+#include <concepts>
+#include <cstddef>
 #include <functional>
 #include <memory_resource>
-#include <mutex>
-#include <limits>
-#include <queue>
-#include <semaphore>
+#include <optional>
 #include <thread>
+#include <tuple>
+#include <type_traits>
 #include <utility>
 #include <coio/detail/execution.h>
-#include <coio/detail/op_queue.h>
 #include <coio/detail/atomic_intrusive_stack.h>
-#include <coio/detail/operation_base.h>
+#include <coio/detail/driver.h>
 #include <coio/utils/stop_token.h>
 #include <coio/utils/utility.h>
 #include <coio/detail/suppress_push.h> // IWYU pragma: keep
@@ -24,406 +23,305 @@ namespace coio {
     class task;
 
     namespace detail {
-        template<typename Ctx>
-        class loop_base {
-            friend Ctx;
-        public:
-            struct node : detail::operation_base {
-                node(Ctx& context) noexcept : context_(context) {}
+        // A run-queue node that knows its owning executor, so its op-state can submit itself onto the
+        // executor's inbox. Generic over the executor type (was loop_base::node, minus the CRTP).
+        template<typename Executor>
+        struct exec_node : operation_base {
+            explicit exec_node(Executor& ex) noexcept : context_(ex) {}
+            exec_node(const exec_node&) = delete;
+            auto operator= (const exec_node&) -> exec_node& = delete;
 
-                node(const node&) = delete;
+            COIO_ALWAYS_INLINE auto immediately_post() -> void {
+                COIO_ASSERT(next_ == nullptr);
+                context_.submit(*this);
+            }
 
-                ~node() = default;
+            Executor& context_; // NOLINT(*-avoid-const-or-ref-data-members)
+        };
 
-                auto operator= (const node&) -> node& = delete;
-
-                COIO_ALWAYS_INLINE auto immediately_post() -> void {
-                    COIO_ASSERT(next_ == nullptr);
-                    context_.post_node(*this);
-                }
-
-                Ctx& context_;
-            };
-
-            template<typename Base>
-            class operation_state : public Base {
-            private:
-                using stop_token_t = stop_token_of_t<execution::env_of_t<decltype(std::declval<Base*>()->rcvr_)>>;
-
-            public:
-                using operation_state_concept = execution::operation_state_tag;
-
-            public:
-                using Base::Base;
-
-                auto start() & noexcept -> void {
-                    this->context_.work_started();
-                    if constexpr (not unstoppable_token<stop_token_t>) {
-                        auto stop_token = coio::get_stop_token(execution::get_env(this->rcvr_));
-                        if (stop_token.stop_requested()) {
-                            this->context_.work_finished();
-                            execution::set_stopped(std::move(this->rcvr_));
-                            return;
-                        }
-                        stop_cb_.emplace(
-                            std::move(stop_token),
-                            std::bind_front(&operation_state::do_cancel, this)
-                        );
-                    }
-                    if (not this->do_start()) {
-                        finish();
-                    }
-                }
-
-                auto finish() -> void override {
-                    this->context_.work_finished();
-                    stop_cb_.reset();
-                    this->do_finish(coio::get_stop_token(execution::get_env(this->rcvr_)).stop_requested());
-                }
-
-            protected:
-                using callback_t = decltype(std::bind_front(&operation_state::do_cancel, std::declval<operation_state*>()));
-                std::optional<stop_callback_for_t<stop_token_t, callback_t>> stop_cb_;
-            };
-
-            struct env {
-                auto query(execution::get_completion_scheduler_t<execution::set_value_t>) const noexcept {
-                    return ctx_.get_scheduler();
-                }
-
-                auto query(get_allocator_t) const noexcept -> std::pmr::polymorphic_allocator<> {
-                    return ctx_.get_allocator();
-                }
-
-                Ctx& ctx_; // NOLINT(*-avoid-const-or-ref-data-members)
-            };
-
-            class schedule_sender {
-                friend Ctx;
-            private:
-                template<typename Rcvr>
-                struct state_base : node {
-                    state_base(Ctx& context, Rcvr rcvr) noexcept : node(context), rcvr_(std::move(rcvr)) {}
-
-                    COIO_ALWAYS_INLINE auto do_start() noexcept -> bool {
-                        this->immediately_post();
-                        return true;
-                    }
-
-                    COIO_ALWAYS_INLINE auto do_finish(bool) noexcept -> void {
-                        execution::set_value(std::move(rcvr_));
-                    }
-
-                    COIO_ALWAYS_INLINE static auto do_cancel(state_base*) noexcept -> void {}
-
-                    Rcvr rcvr_;
-                };
-
-                template<typename Rcvr>
-                using state = operation_state<state_base<Rcvr>>;
-
-            public:
-                using sender_concept = execution::sender_tag;
-                using completion_signatures = execution::completion_signatures<execution::set_value_t()>;
-
-            public:
-                explicit schedule_sender(Ctx& context) noexcept : ctx_(&context) {}
-
-                COIO_ALWAYS_INLINE auto get_env() const noexcept -> env {
-                    return env{*ctx_};
-                }
-
-                template<similar_to<schedule_sender>, typename...>
-                static consteval auto get_completion_signatures() noexcept -> completion_signatures {
-                    return {};
-                }
-
-                template<execution::receiver Rcvr>
-                COIO_ALWAYS_INLINE auto connect(Rcvr rcvr) && noexcept {
-                    COIO_ASSERT(ctx_ != nullptr);
-                    return state<Rcvr>{*std::exchange(ctx_, {}), std::move(rcvr)};
-                }
-
-            private:
-                Ctx* ctx_;
-            };
-
-            class sleep_sender {
-                friend Ctx;
-            public:
-                using sender_concept = execution::sender_tag;
-                using completion_signatures = execution::completion_signatures<
-                    execution::set_value_t(),
-                    execution::set_stopped_t()
-                >;
-                using clock_type = std::chrono::steady_clock;
-                using duration_type = clock_type::duration;
-                using time_point_type = clock_type::time_point;
-
-                struct timer_node : node {
-                    timer_node(Ctx& context, time_point_type deadline) noexcept: node(context), deadline(deadline) {}
-                    time_point_type deadline;
-                    std::size_t heap_index = static_cast<std::size_t>(-1);
-                };
-
-                template<typename Rcvr>
-                struct state_base : timer_node {
-                    state_base(Rcvr rcvr, Ctx& context, time_point_type deadline) noexcept: timer_node(context, deadline), rcvr_(std::move(rcvr)) {}
-
-                    auto do_start() noexcept -> bool {
-                        auto& context = this->context_;
-                        if (context.timer_queue_.add(*this)) context.interrupt();
-                        return true;
-                    }
-
-                    auto do_finish(bool canceled) noexcept -> void {
-                        if (canceled) execution::set_stopped(std::move(rcvr_));
-                        else execution::set_value(std::move(rcvr_));
-                    }
-
-                    auto do_cancel() noexcept -> void {
-                        if (this->context_.timer_queue_.remove(*this)) {
-                            this->context_.post_node(*this);
-                        }
-                    }
-
-                    Rcvr rcvr_;
-                };
-
-                template<typename Rcvr>
-                using state = operation_state<state_base<Rcvr>>;
-
-            public:
-                sleep_sender(Ctx& context, time_point_type deadline) noexcept : ctx_(&context), deadline_(deadline) {}
-
-                sleep_sender(const sleep_sender&) = delete;
-
-                sleep_sender(sleep_sender&& other) noexcept : ctx_(std::exchange(other.ctx_, {})), deadline_(std::exchange(other.deadline_, {})) {}
-
-                ~sleep_sender() = default;
-
-                auto operator= (const sleep_sender&) -> sleep_sender& = delete;
-
-                auto operator= (sleep_sender&& other) noexcept -> sleep_sender& {
-                    ctx_ = std::exchange(other.ctx_, {});
-                    deadline_ = std::exchange(other.deadline_, {});
-                    return *this;
-                }
-
-                COIO_ALWAYS_INLINE auto get_env() const noexcept -> env {
-                    return env{*ctx_};
-                }
-
-                template<similar_to<sleep_sender>, typename...>
-                static consteval auto get_completion_signatures() noexcept -> completion_signatures {
-                    return {};
-                }
-
-                template<execution::receiver Rcvr>
-                COIO_ALWAYS_INLINE auto connect(Rcvr rcvr) && noexcept {
-                    COIO_ASSERT(ctx_ != nullptr);
-                    return state<Rcvr>{
-                        std::move(rcvr),
-                        *std::exchange(ctx_, {}),
-                        std::exchange(deadline_, {})
-                    };
-                }
-
-            private:
-                Ctx* ctx_;
-                time_point_type deadline_;
-            };
-
-        private:
-            class scheduler_base {
-            public:
-                using scheduler_concept = execution::scheduler_tag;
-
-            public:
-                explicit scheduler_base(Ctx& ctx) noexcept : ctx_(&ctx) {}
-
-                [[nodiscard]]
-                COIO_ALWAYS_INLINE static auto now() noexcept -> std::chrono::steady_clock::time_point {
-                    return std::chrono::steady_clock::now();
-                }
-
-                [[nodiscard]]
-                COIO_ALWAYS_INLINE auto schedule() const noexcept -> schedule_sender {
-                    return schedule_sender{*ctx_};
-                }
-
-                template<typename Rep, typename Period>
-                [[nodiscard]]
-                COIO_ALWAYS_INLINE auto schedule_after(std::chrono::duration<Rep, Period> duration) const noexcept {
-                    return this->schedule_at(now() + duration);
-                }
-
-                [[nodiscard]]
-                COIO_ALWAYS_INLINE auto schedule_at(std::chrono::steady_clock::time_point deadline) const noexcept {
-                    return stop_when(sleep_sender{
-                        *ctx_,
-                        deadline
-                    }, ctx_->stop_source_.get_token());
-                }
-
-                [[nodiscard]]
-                COIO_ALWAYS_INLINE auto context() const noexcept -> Ctx& {
-                    COIO_ASSERT(ctx_ != nullptr);
-                    return *ctx_;
-                }
-
-                [[nodiscard]]
-                COIO_ALWAYS_INLINE static constexpr auto query(execution::get_forward_progress_guarantee_t) noexcept {
-                    return execution::forward_progress_guarantee::parallel;
-                }
-
-                [[nodiscard]]
-                COIO_ALWAYS_INLINE auto query(get_allocator_t) const noexcept {
-                    COIO_ASSERT(ctx_ != nullptr);
-                    return ctx_->get_allocator();
-                }
-
-                friend auto operator== (const scheduler_base& lhs, const scheduler_base& rhs) -> bool = default;
-
-            protected:
-                Ctx* ctx_;
-            };
-
-            using timer_queue = detail::timer_queue<
-                typename sleep_sender::timer_node,
-                &sleep_sender::timer_node::deadline,
-                &sleep_sender::timer_node::heap_index,
-                std::pmr::polymorphic_allocator<>
-            >;
-
-        private:
-            loop_base() = default;
-
-            explicit loop_base(std::pmr::memory_resource& memory_resource) noexcept : allocator_(&memory_resource) {}
+        // The generic operation-state wrapper: work-count tracking + stop-token plumbing around a
+        // backend-specific Base (which supplies context_, rcvr_, do_start(), do_finish(bool), do_cancel()).
+        // Ported verbatim from loop_base::operation_state — it is entirely backend-agnostic.
+        template<typename Base>
+        class operation_state : public Base {
+            using stop_token_t = stop_token_of_t<execution::env_of_t<decltype(std::declval<Base*>()->rcvr_)>>;
 
         public:
-            loop_base(const loop_base&) = delete;
+            using operation_state_concept = execution::operation_state_tag;
+            using Base::Base;
 
-            auto operator= (const loop_base&) -> loop_base& = delete;
-
-            [[nodiscard]]
-            COIO_ALWAYS_INLINE auto get_scheduler() noexcept {
-                using scheduler_t = typename Ctx::scheduler;
-                return scheduler_t{static_cast<Ctx&>(*this)};
-            }
-
-            [[nodiscard]]
-            COIO_ALWAYS_INLINE auto get_allocator() const noexcept -> std::pmr::polymorphic_allocator<> {
-                return allocator_;
-            }
-
-            COIO_ALWAYS_INLINE auto request_stop() -> void {
-                if (stop_source_.request_stop()) static_cast<Ctx*>(this)->shutdown();
-            }
-
-            COIO_ALWAYS_INLINE auto notify() noexcept -> void {
-                if (park_aware_) {
-                    std::atomic_thread_fence(std::memory_order_seq_cst);
-                    if (not parked_.load(std::memory_order_relaxed)) return;
+            auto start() & noexcept -> void {
+                this->context_.work_started();
+                if constexpr (not unstoppable_token<stop_token_t>) {
+                    auto stop_token = coio::get_stop_token(execution::get_env(this->rcvr_));
+                    if (stop_token.stop_requested()) {
+                        this->context_.work_finished();
+                        execution::set_stopped(std::move(this->rcvr_));
+                        return;
+                    }
+                    stop_cb_.emplace(std::move(stop_token), std::bind_front(&operation_state::do_cancel, this));
                 }
-                static_cast<Ctx*>(this)->interrupt();
+                if (not this->do_start()) finish();
             }
 
-            // Post any ready operation (a context node OR a runtime's balanced op) to this loop from
-            // any thread: onto the owner's local queue if we are the owner, else the lock-free inject
-            // stack (single-owner) or the shared queue (multi-owner). This is the single inbox — the
-            // runtime's balanced tier round-robins onto it, so there is no separate injector.
-            COIO_ALWAYS_INLINE auto post_node(detail::operation_base& op) -> void {
-                if (owner_.load(std::memory_order_relaxed) == std::this_thread::get_id()) {
-                    local_queue_.push_back(op);
-                    return;
-                }
-                if (lockfree_inject_) {
-                    if (inject_stack_.push(op) != detail::stack_status::not_empty) notify();
-                    return;
-                }
-                static_cast<Ctx*>(this)->post_remote(op);
-            }
-
-            COIO_ALWAYS_INLINE auto work_started() noexcept -> void {
-                ++work_count_;
-            }
-
-            COIO_ALWAYS_INLINE auto work_finished() noexcept -> void {
-                if (--work_count_ == 0) static_cast<Ctx*>(this)->shutdown();
-            }
-
-            auto poll_one() -> bool {
-                auto self = static_cast<Ctx*>(this);
-                return self->do_one(false);
-            }
-
-            auto poll() -> std::size_t {
-                auto self = static_cast<Ctx*>(this);
-                std::size_t count = 0;
-                while (poll_one()) {
-                    if (count < std::numeric_limits<std::size_t>::max()) ++count;
-                }
-                return count;
-            }
-
-            auto run_one() -> bool {
-                auto self = static_cast<Ctx*>(this);
-                return self->do_one(true);
-            }
-
-            auto run() -> std::size_t {
-                auto self = static_cast<Ctx*>(this);
-                std::size_t count = 0;
-                while (run_one()) {
-                    if (count < std::numeric_limits<std::size_t>::max()) ++count;
-                }
-                return count;
+            auto finish() -> void override {
+                this->context_.work_finished();
+                stop_cb_.reset();
+                this->do_finish(coio::get_stop_token(execution::get_env(this->rcvr_)).stop_requested());
             }
 
         protected:
-            COIO_ALWAYS_INLINE auto drain_inject() noexcept -> void {
-                // Cheap acquire load avoids the atomic exchange (pop_all) every turn when nothing was
-                // injected; a cross-thread post always notify()s, so a missed turn is re-driven.
-                if (inject_stack_.empty()) return;
-                auto* n = inject_stack_.pop_all();
-                detail::operation_base* fifo = nullptr;
-                while (n) {
-                    auto* next = n->next_;
-                    n->next_ = fifo;
-                    fifo = n;
-                    n = next;
-                }
-                while (fifo) {
-                    auto* next = fifo->next_;
-                    local_queue_.push_back(*fifo);
-                    fifo = next;
-                }
+            using callback_t = decltype(std::bind_front(&operation_state::do_cancel, std::declval<operation_state*>()));
+            std::optional<stop_callback_for_t<stop_token_t, callback_t>> stop_cb_;
+        };
+
+        template<typename Executor>
+        struct exec_env {
+            auto query(execution::get_completion_scheduler_t<execution::set_value_t>) const noexcept {
+                return ctx_.get_scheduler();
+            }
+            auto query(get_allocator_t) const noexcept -> std::pmr::polymorphic_allocator<> {
+                return ctx_.get_allocator();
+            }
+            Executor& ctx_; // NOLINT(*-avoid-const-or-ref-data-members)
+        };
+
+        // Placement: "run this continuation on the executor." The op-state just submits itself onto the
+        // executor's run queue; no driver is involved. (Was loop_base::schedule_sender.)
+        template<typename Executor>
+        class schedule_sender {
+            friend Executor;
+
+            template<typename Rcvr>
+            struct state_base : exec_node<Executor> {
+                state_base(Executor& ctx, Rcvr rcvr) noexcept : exec_node<Executor>(ctx), rcvr_(std::move(rcvr)) {}
+
+                COIO_ALWAYS_INLINE auto do_start() noexcept -> bool { this->immediately_post(); return true; }
+                COIO_ALWAYS_INLINE auto do_finish(bool) noexcept -> void { execution::set_value(std::move(rcvr_)); }
+                COIO_ALWAYS_INLINE static auto do_cancel(state_base*) noexcept -> void {}
+
+                Rcvr rcvr_;
+            };
+            template<typename Rcvr>
+            using state = operation_state<state_base<Rcvr>>;
+
+        public:
+            using sender_concept = execution::sender_tag;
+            using completion_signatures = execution::completion_signatures<execution::set_value_t()>;
+
+            explicit schedule_sender(Executor& ctx) noexcept : ctx_(&ctx) {}
+
+            COIO_ALWAYS_INLINE auto get_env() const noexcept -> exec_env<Executor> { return {*ctx_}; }
+
+            template<similar_to<schedule_sender>, typename...>
+            static consteval auto get_completion_signatures() noexcept -> completion_signatures { return {}; }
+
+            template<execution::receiver Rcvr>
+            COIO_ALWAYS_INLINE auto connect(Rcvr rcvr) && noexcept {
+                COIO_ASSERT(ctx_ != nullptr);
+                return state<Rcvr>{*std::exchange(ctx_, {}), std::move(rcvr)};
             }
 
-            COIO_ALWAYS_INLINE auto shutdown() -> void {
-                static_cast<Ctx*>(this)->interrupt();
+        private:
+            Executor* ctx_;
+        };
+
+        // The scheduler handle. Placement (schedule) is always available; capability senders
+        // (schedule_after, io) are added in coio/scheduler.h, gated on the executor's drivers.
+        template<typename Executor>
+        class executor_scheduler {
+            friend Executor;
+
+        public:
+            using scheduler_concept = execution::scheduler_tag;
+            using executor_type = Executor;
+
+            explicit executor_scheduler(Executor& ctx) noexcept : ctx_(&ctx) {}
+
+            [[nodiscard]] COIO_ALWAYS_INLINE auto schedule() const noexcept -> schedule_sender<Executor> {
+                return schedule_sender<Executor>{*ctx_};
             }
 
-            [[noreturn]] auto post_remote(detail::operation_base&) -> void {
-                unreachable();
+            [[nodiscard]] COIO_ALWAYS_INLINE static constexpr auto query(execution::get_forward_progress_guarantee_t) noexcept {
+                return execution::forward_progress_guarantee::parallel;
             }
+            [[nodiscard]] COIO_ALWAYS_INLINE auto query(get_allocator_t) const noexcept {
+                COIO_ASSERT(ctx_ != nullptr);
+                return ctx_->get_allocator();
+            }
+            [[nodiscard]] COIO_ALWAYS_INLINE auto context() const noexcept -> Executor& {
+                COIO_ASSERT(ctx_ != nullptr);
+                return *ctx_;
+            }
+
+            friend auto operator== (const executor_scheduler&, const executor_scheduler&) noexcept -> bool = default;
 
         protected:
-            using op_queue = detail::op_queue<detail::operation_base, &detail::operation_base::next_>;
-
-            std::pmr::polymorphic_allocator<> allocator_;
-            inplace_stop_source stop_source_;
-            detail::atomic_intrusive_stack<detail::operation_base> inject_stack_{&detail::operation_base::next_};
-            detail::intrusive_list<detail::operation_base> local_queue_{&detail::operation_base::next_};
-            std::atomic<std::thread::id> owner_{};
-            bool lockfree_inject_ = false;
-            bool park_aware_ = false;
-            std::atomic<bool> parked_{false};
-            timer_queue timer_queue_{allocator_};
-            std::atomic<std::size_t> work_count_{0};
+            Executor* ctx_;
         };
     }
+
+    // ============================================================================================
+    // executor<WaitDrv, Rest...> — one thread's run loop + inbox + park state, over a driver set. The
+    // FIRST driver is the wait-owner (blocks/wakes the thread). Single-owner: exactly one thread ever
+    // calls run()/run_once(); cross-thread work arrives via the lock-free inject stack.
+    // ============================================================================================
+    template<detail::wait_driver WaitDrv, detail::driver... Rest>
+    class executor {
+        // The wait-driver contributes its scheduler type if it has one (e.g. uring adds io ops); this is
+        // how uring io stays localized to the uring header while execution_context.h stays liburing-free.
+        template<typename D, typename Ex>
+        static auto pick_scheduler() {
+            if constexpr (requires { typename D::template scheduler_of<Ex>; })
+                return std::type_identity<typename D::template scheduler_of<Ex>>{};
+            else
+                return std::type_identity<detail::executor_scheduler<Ex>>{};
+        }
+
+    public:
+        using scheduler = typename decltype(pick_scheduler<WaitDrv, executor>())::type;
+        template<typename T = void, typename Alloc = void>
+        using task = coio::task<T, Alloc, scheduler>;
+        using wait_driver_type = WaitDrv;
+
+        executor() { attach_drivers(); }
+        explicit executor(std::pmr::memory_resource& mr) noexcept : allocator_(&mr) { attach_drivers(); }
+
+        // Construct the (sole) wait-driver in-place from Args. Drivers own kernel resources and are
+        // non-movable, so they're built in the tuple, not passed by value. tuple's element-wise ctor
+        // initialises the element in place (no move). This is how uring_runtime forwards `entries`:
+        // executor(std::in_place, entries) -> uring_driver{entries}. (Single-driver executors only; a
+        // multi-driver executor with per-driver ctor args would need a richer builder.)
+        template<typename... Args>
+            requires (sizeof...(Rest) == 0) and std::constructible_from<WaitDrv, Args&&...>
+        explicit executor(std::in_place_t, Args&&... args)
+            : drivers_(std::forward<Args>(args)...) { attach_drivers(); }
+
+        executor(const executor&) = delete;
+        auto operator= (const executor&) -> executor& = delete;
+
+        template<typename Cap>
+        static constexpr bool has_capability =
+            std::same_as<Cap, typename WaitDrv::capability> or (std::same_as<Cap, typename Rest::capability> or ...);
+
+        template<typename Cap>
+        [[nodiscard]] COIO_ALWAYS_INLINE auto get_driver() noexcept -> auto& {
+            static_assert(has_capability<Cap>, "this executor owns no driver for that capability");
+            return driver_for<Cap>(std::make_index_sequence<1 + sizeof...(Rest)>{});
+        }
+
+        [[nodiscard]] COIO_ALWAYS_INLINE auto get_scheduler() noexcept -> scheduler { return scheduler{*this}; }
+        [[nodiscard]] COIO_ALWAYS_INLINE auto get_allocator() const noexcept -> std::pmr::polymorphic_allocator<> { return allocator_; }
+
+        // Submit a ready operation. Owner -> straight onto the run queue; any other thread -> lock-free
+        // inject stack, waking us iff we made it non-empty (and we are parked).
+        COIO_ALWAYS_INLINE auto submit(detail::operation_base& op) -> void {
+            if (owner_.load(std::memory_order_relaxed) == std::this_thread::get_id()) {
+                ready_.push_back(op);
+                return;
+            }
+            if (inject_stack_.push(op) != detail::stack_status::not_empty) wake_up();
+        }
+
+        COIO_ALWAYS_INLINE auto wake_up() noexcept -> void {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (parked_.load(std::memory_order_relaxed)) wait_driver().wake_up();
+        }
+
+        COIO_ALWAYS_INLINE auto work_started() noexcept -> void { ++work_count_; }
+        COIO_ALWAYS_INLINE auto work_finished() noexcept -> void { if (--work_count_ == 0) wake_up(); }
+
+        COIO_ALWAYS_INLINE auto request_stop() -> void {
+            if (stop_source_.request_stop()) wake_up();
+        }
+
+        [[nodiscard]] auto get_stop_token() const noexcept { return stop_source_.get_token(); }
+
+        // One non-blocking pass: claim ownership, drain posts, poll every driver, run up to `batch`
+        // ready continuations. Returns whether it did any work. Never blocks.
+        auto run_once() -> bool {
+            owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+            drain_inbox();
+            std::apply([&](auto&... d) { (d.poll(ready_, batch_), ...); }, drivers_);
+            bool did_work = false;
+            for (std::size_t i = 0; i < batch_; ++i) {
+                auto* op = ready_.pop_front();
+                if (op == nullptr) break;
+                op->finish();
+                did_work = true;
+            }
+            return did_work;
+        }
+
+        auto run() -> std::size_t {
+            owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+            std::size_t turns = 0;
+            for (;;) {
+                if (run_once()) { ++turns; continue; }  // made progress (drained inbox / ran ready ops)
+
+                // Idle. Exit only when there is also no outstanding async work; otherwise block. (Note we
+                // drain+run BEFORE this check, so ops submitted without a work-count — e.g. bare
+                // operation_base posts — still run, matching the old loop_base do_one ordering.)
+                if (work_count_.load(std::memory_order_relaxed) == 0) break;
+
+                // Arm elision, publish, re-check the inbox (Dekker), else block in the wait-owner.
+                parked_.store(true, std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (run_once()) { parked_.store(false, std::memory_order_relaxed); ++turns; continue; }
+                wait_driver().poll_wait();
+                parked_.store(false, std::memory_order_relaxed);
+            }
+            return turns;
+        }
+
+        [[nodiscard]] COIO_ALWAYS_INLINE auto is_owner() const noexcept -> bool {
+            return owner_.load(std::memory_order_relaxed) == std::this_thread::get_id();
+        }
+
+    private:
+        [[nodiscard]] COIO_ALWAYS_INLINE auto wait_driver() noexcept -> WaitDrv& { return std::get<0>(drivers_); }
+
+        template<typename Cap, std::size_t... I>
+        [[nodiscard]] COIO_ALWAYS_INLINE auto driver_for(std::index_sequence<I...>) noexcept -> auto& {
+            // Return the first driver whose capability == Cap. Exactly one matches (has_capability).
+            return pick<Cap, I...>();
+        }
+        template<typename Cap, std::size_t I, std::size_t... Rest2>
+        [[nodiscard]] COIO_ALWAYS_INLINE auto pick() noexcept -> auto& {
+            using D = std::tuple_element_t<I, std::tuple<WaitDrv, Rest...>>;
+            if constexpr (std::same_as<Cap, typename D::capability>) return std::get<I>(drivers_);
+            else return pick<Cap, Rest2...>();
+        }
+
+        // Install an executor_sink on any driver that accepts one (readiness drivers post ready ops back
+        // to us outside poll()). Non-movable executor => `this` is a stable address to capture.
+        auto attach_drivers() noexcept -> void {
+            const detail::executor_sink sink{this, +[](void* e, detail::operation_base& op) noexcept {
+                static_cast<executor*>(e)->submit(op);
+            }};
+            std::apply([&](auto&... d) {
+                ([&] { if constexpr (requires { d.attach(sink); }) d.attach(sink); }(), ...);
+            }, drivers_);
+        }
+
+        COIO_ALWAYS_INLINE auto drain_inbox() noexcept -> void {
+            if (inject_stack_.empty()) return;
+            auto* n = inject_stack_.pop_all();
+            detail::operation_base* fifo = nullptr;
+            while (n) { auto* next = n->next_; n->next_ = fifo; fifo = n; n = next; }
+            while (fifo) { auto* next = fifo->next_; ready_.push_back(*fifo); fifo = next; }
+        }
+
+        std::tuple<WaitDrv, Rest...> drivers_;
+        std::pmr::polymorphic_allocator<> allocator_;
+        inplace_stop_source stop_source_;
+        detail::atomic_intrusive_stack<detail::operation_base> inject_stack_{&detail::operation_base::next_};
+        detail::ready_queue ready_{&detail::operation_base::next_};
+        std::atomic<std::thread::id> owner_{};
+        std::atomic<bool> parked_{false};
+        std::atomic<std::size_t> work_count_{0};
+        std::size_t batch_ = 64;
+    };
 
     template<typename ExecutionContext>
     concept execution_context = requires(ExecutionContext& context) {
@@ -436,109 +334,13 @@ namespace coio {
     class work_guard {
     public:
         work_guard() = default;
-
-        explicit work_guard(ExecutionContext& context) noexcept : context_(&context) {
-            context.work_started();
-        }
-
-        work_guard(const work_guard& other) noexcept : context_(other.context_) {
-            if (context_) context_->work_started();
-        }
-
+        explicit work_guard(ExecutionContext& context) noexcept : context_(&context) { context.work_started(); }
+        work_guard(const work_guard& other) noexcept : context_(other.context_) { if (context_) context_->work_started(); }
         work_guard(work_guard&& other) noexcept : context_(std::exchange(other.context_, {})) {}
-
-        ~work_guard() {
-            if (context_) context_->work_finished();
-        }
-
-        auto operator= (work_guard other) noexcept -> work_guard& {
-            std::swap(context_, other.context_);
-            return *this;
-        }
-
+        ~work_guard() { if (context_) context_->work_finished(); }
+        auto operator= (work_guard other) noexcept -> work_guard& { std::swap(context_, other.context_); return *this; }
     private:
         ExecutionContext* context_ = nullptr;
-    };
-
-    class time_loop : public detail::loop_base<time_loop> {
-        friend loop_base;
-    public:
-        struct scheduler : scheduler_base {
-            using scheduler_base::scheduler_base;
-        };
-
-        template<typename T = void, typename Alloc = void>
-        using task = coio::task<T, Alloc, scheduler>;
-
-    public:
-        using loop_base::loop_base;
-
-        ~time_loop() = default;
-
-    private:
-        auto do_one(bool infinite) -> bool {
-            if (work_count_ == 0) return false;
-
-            while (work_count_ > 0) {
-                if (const auto op = op_queue_.try_dequeue()) {
-                    op->finish();
-                    return true;
-                }
-
-                std::unique_lock lock{bolt_, std::try_to_lock};
-                if (not lock) {
-                    return consume(infinite);
-                }
-
-                if (infinite) {
-                    if (const auto earliest = timer_queue_.earliest()) {
-                        static_cast<void>(sema_.try_acquire_until(*earliest));
-                    }
-                    else {
-                        sema_.acquire();
-                    }
-                }
-
-                detail::intrusive_list<detail::operation_base> ready_time_ops{&detail::operation_base::next_};
-                timer_queue_.take_ready_timers(ready_time_ops);
-
-                lock.unlock();
-
-                if (auto ops = ready_time_ops.release()) op_queue_.enqueue(*ops);
-
-                if (not infinite) {
-                    const auto op = op_queue_.try_dequeue();
-                    if (op) op->finish();
-                    return op != nullptr;
-                }
-            }
-            return false;
-        }
-
-        COIO_ALWAYS_INLINE auto interrupt() noexcept -> void {
-            sema_.release();
-        }
-
-        COIO_ALWAYS_INLINE auto consume(bool infinite) -> bool {
-            detail::operation_base* op = infinite ? op_queue_.dequeue() : op_queue_.try_dequeue();
-            if (op) op->finish();
-            return op;
-        }
-
-        COIO_ALWAYS_INLINE auto post_remote(detail::operation_base& n) -> void {
-            op_queue_.enqueue(n);
-            notify();
-        }
-
-        COIO_ALWAYS_INLINE auto shutdown() -> void {
-            interrupt();
-            op_queue_.request_stop();
-        }
-
-    private:
-        op_queue op_queue_;
-        atomutex bolt_;
-        std::counting_semaphore<> sema_{0};
     };
 }
 

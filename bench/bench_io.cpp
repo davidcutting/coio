@@ -75,4 +75,41 @@ namespace {
         state.SetItemsProcessed(state.iterations() * tasks);
     }
     BENCHMARK(multi_threaded_run)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseRealTime();
+
+    // Frame-pool churn: a bounded pipeline of pinned coroutines. Each task does a little work then
+    // spawns its replacement ON its worker, keeping ~k in flight, so completed frames recycle through
+    // the worker's frame pool instead of being malloc'd fresh. buf[] makes the frame non-trivial.
+    auto churn_task(coio::uring_runtime* rt, io_context::scheduler sched, std::atomic<long>* remaining)
+        -> io_context::task<> {
+        char buf[256];
+        benchmark::DoNotOptimize(buf);
+        if (remaining->fetch_sub(1, std::memory_order_relaxed) > 0) {
+            rt->spawn_on(sched, churn_task(rt, sched, remaining));
+        }
+        co_return;
+    }
+
+    void coroutine_churn(benchmark::State& state) {
+        constexpr long total = 200'000;
+        constexpr long depth = 64; // in-flight pipeline depth
+        for (auto _ : state) {
+            state.PauseTiming();
+            std::optional<coio::uring_runtime> rt{std::in_place, std::size_t{1}, std::size_t{256}};
+            std::atomic<long> remaining{total};
+            state.ResumeTiming();
+
+            rt->spawn(coio::just() | coio::let_value([&] {
+                auto sched = *coio::uring_runtime::current_scheduler();
+                for (long i = 0; i < depth; ++i) rt->spawn_on(sched, churn_task(&*rt, sched, &remaining));
+                return coio::just();
+            }));
+            coio::this_thread::sync_wait(rt->join());
+
+            state.PauseTiming();
+            rt.reset();
+            state.ResumeTiming();
+        }
+        state.SetItemsProcessed(state.iterations() * total);
+    }
+    BENCHMARK(coroutine_churn)->UseRealTime();
 }

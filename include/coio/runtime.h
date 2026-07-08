@@ -12,6 +12,7 @@
 #include <vector>
 #include <coio/execution_context.h>
 #include <coio/detail/operation_base.h>
+#include <coio/detail/frame_pool.h>
 #include <coio/utils/async_scope.h>
 
 namespace coio {
@@ -213,7 +214,12 @@ namespace coio {
 
         static auto run_worker(Worker& worker) -> void {
             current_worker_ = &worker;
+            // Frames of coroutines created on this worker recycle through this per-thread pool. It is a
+            // stack local, destroyed only after run() drains (so no live frame outlives it).
+            detail::frame_pool pool;
+            detail::tl_frame_pool = &pool;
             worker.run();
+            detail::tl_frame_pool = nullptr;
             current_worker_ = nullptr;
         }
 

@@ -4,6 +4,7 @@
 #include <memory>
 #include <utility>
 #include <coio/detail/config.h>
+#include <coio/detail/frame_pool.h>
 #include <coio/detail/suppress_push.h> // IWYU pragma: keep
 
 namespace coio::detail {
@@ -144,7 +145,14 @@ namespace coio::detail {
     template<typename Alloc>
     struct promise_alloc_control {
         auto operator new (std::size_t n) -> void* requires std::same_as<Alloc, void> or std::default_initializable<Alloc> {
-            return co_memory<Alloc>::allocate(std::conditional_t<std::same_as<Alloc, void>, std::allocator<void>, Alloc>(), n);
+            if constexpr (std::same_as<Alloc, void>) {
+                // Default frames go through the current worker's frame pool (recycled for pinned tasks;
+                // plain malloc off-worker). co_memory<void> stores a pool-aware deallocator in the frame.
+                return co_memory<void>::allocate(frame_pool_allocator<>{}, n);
+            }
+            else {
+                return co_memory<Alloc>::allocate(Alloc{}, n);
+            }
         }
 
         template<typename OtherAlloc, typename... Args> requires std::same_as<Alloc, void> or std::convertible_to<const OtherAlloc&, Alloc>

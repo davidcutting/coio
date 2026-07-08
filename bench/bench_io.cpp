@@ -19,6 +19,7 @@
 #include <coio/asyncio/io.h>
 #include <coio/asyncio/file.h>
 #include <coio/asyncio/uring_context.h>
+#include <coio/uring_runtime.h>
 
 namespace {
     using io_context = coio::uring_context;
@@ -56,28 +57,19 @@ namespace {
     BENCHMARK(thread_affine_run)->Arg(1)->Arg(8)->Arg(64)->Arg(256)->UseRealTime();
 
     void multi_threaded_run(benchmark::State& state) {
-        const int threads = static_cast<int>(state.range(0));
+        const std::size_t workers = static_cast<std::size_t>(state.range(0));
         constexpr long tasks = 200'000;
+        constexpr std::size_t entries = 256;
         for (auto _ : state) {
             state.PauseTiming();
-            std::optional<io_context> ctx{std::in_place};
-            coio::async_scope scope;
-            // keep the shared loop alive while several threads drive it and we spawn onto it
-            std::optional<coio::work_guard<io_context>> guard{std::in_place, *ctx};
-            std::vector<std::jthread> runners;
-            runners.reserve(threads);
-            for (int t = 0; t < threads; ++t) runners.emplace_back([&ctx] { ctx->run(); });
+            std::optional<coio::uring_runtime> rt{std::in_place, workers, entries};
             state.ResumeTiming();
 
-            // timed region: producer posts to the shared queue; the N run() threads drain it
-            for (long i = 0; i < tasks; ++i) scope.spawn_on(ctx->get_scheduler(), coio::just());
-            guard.reset();
-            coio::this_thread::sync_wait(scope.join());
+            for (long i = 0; i < tasks; ++i) rt->spawn(coio::just());
+            coio::this_thread::sync_wait(rt->join());
 
             state.PauseTiming();
-            ctx->request_stop();
-            runners.clear(); // jthreads join
-            ctx.reset();
+            rt.reset();
             state.ResumeTiming();
         }
         state.SetItemsProcessed(state.iterations() * tasks);

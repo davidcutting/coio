@@ -228,7 +228,6 @@ namespace coio {
 
     private:
         int epoll_fd_;
-        atomutex bolt_;
         detail::reactor_interrupter interrupter_;
     };
 

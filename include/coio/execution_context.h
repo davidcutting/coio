@@ -9,10 +9,14 @@
 #include <limits>
 #include <queue>
 #include <semaphore>
+#include <thread>
 #include <utility>
 #include <coio/detail/execution.h>
 #include <coio/detail/op_queue.h>
+#include <coio/detail/atomic_intrusive_stack.h>
+#include <coio/detail/operation_base.h>
 #include <coio/utils/stop_token.h>
+#include <coio/utils/utility.h>
 #include <coio/detail/suppress_push.h> // IWYU pragma: keep
 
 namespace coio {
@@ -24,7 +28,7 @@ namespace coio {
         class loop_base {
             friend Ctx;
         public:
-            struct node {
+            struct node : detail::operation_base {
                 node(Ctx& context) noexcept : context_(context) {}
 
                 node(const node&) = delete;
@@ -33,17 +37,12 @@ namespace coio {
 
                 auto operator= (const node&) -> node& = delete;
 
-                virtual auto finish() -> void = 0;
-
                 COIO_ALWAYS_INLINE auto immediately_post() -> void {
                     COIO_ASSERT(next_ == nullptr);
-                    auto& context = context_;
-                    context.op_queue_.enqueue(*this);
-                    context.interrupt();
+                    context_.post_node(*this);
                 }
 
                 Ctx& context_;
-                node* next_{};
             };
 
             template<typename Base>
@@ -184,8 +183,7 @@ namespace coio {
 
                     auto do_cancel() noexcept -> void {
                         if (this->context_.timer_queue_.remove(*this)) {
-                            this->context_.op_queue_.enqueue(*this);
-                            this->context_.interrupt();
+                            this->context_.post_node(*this);
                         }
                     }
 
@@ -298,8 +296,6 @@ namespace coio {
                 std::pmr::polymorphic_allocator<>
             >;
 
-            using op_queue = detail::op_queue<node, &node::next_>;
-
         private:
             loop_base() = default;
 
@@ -322,7 +318,31 @@ namespace coio {
             }
 
             COIO_ALWAYS_INLINE auto request_stop() -> void {
-                if (stop_source_.request_stop()) shutdown();
+                if (stop_source_.request_stop()) static_cast<Ctx*>(this)->shutdown();
+            }
+
+            COIO_ALWAYS_INLINE auto notify() noexcept -> void {
+                if (park_aware_) {
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    if (not parked_.load(std::memory_order_relaxed)) return;
+                }
+                static_cast<Ctx*>(this)->interrupt();
+            }
+
+            // Post any ready operation (a context node OR a runtime's balanced op) to this loop from
+            // any thread: onto the owner's local queue if we are the owner, else the lock-free inject
+            // stack (single-owner) or the shared queue (multi-owner). This is the single inbox — the
+            // runtime's balanced tier round-robins onto it, so there is no separate injector.
+            COIO_ALWAYS_INLINE auto post_node(detail::operation_base& op) -> void {
+                if (owner_.load(std::memory_order_relaxed) == std::this_thread::get_id()) {
+                    local_queue_.push_back(op);
+                    return;
+                }
+                if (lockfree_inject_) {
+                    if (inject_stack_.push(op) != detail::stack_status::not_empty) notify();
+                    return;
+                }
+                static_cast<Ctx*>(this)->post_remote(op);
             }
 
             COIO_ALWAYS_INLINE auto work_started() noexcept -> void {
@@ -330,7 +350,7 @@ namespace coio {
             }
 
             COIO_ALWAYS_INLINE auto work_finished() noexcept -> void {
-                if (--work_count_ == 0) shutdown();
+                if (--work_count_ == 0) static_cast<Ctx*>(this)->shutdown();
             }
 
             auto poll_one() -> bool {
@@ -362,22 +382,44 @@ namespace coio {
             }
 
         protected:
-            COIO_ALWAYS_INLINE auto consume(bool infinite) -> bool {
-                node* op = infinite ? op_queue_.dequeue() : op_queue_.try_dequeue();
-                if (op) op->finish();
-                return op;
+            COIO_ALWAYS_INLINE auto drain_inject() noexcept -> void {
+                // Cheap acquire load avoids the atomic exchange (pop_all) every turn when nothing was
+                // injected; a cross-thread post always notify()s, so a missed turn is re-driven.
+                if (inject_stack_.empty()) return;
+                auto* n = inject_stack_.pop_all();
+                detail::operation_base* fifo = nullptr;
+                while (n) {
+                    auto* next = n->next_;
+                    n->next_ = fifo;
+                    fifo = n;
+                    n = next;
+                }
+                while (fifo) {
+                    auto* next = fifo->next_;
+                    local_queue_.push_back(*fifo);
+                    fifo = next;
+                }
             }
 
             COIO_ALWAYS_INLINE auto shutdown() -> void {
-                auto self = static_cast<Ctx*>(this);
-                self->interrupt();
-                op_queue_.request_stop();
+                static_cast<Ctx*>(this)->interrupt();
+            }
+
+            [[noreturn]] auto post_remote(detail::operation_base&) -> void {
+                unreachable();
             }
 
         protected:
+            using op_queue = detail::op_queue<detail::operation_base, &detail::operation_base::next_>;
+
             std::pmr::polymorphic_allocator<> allocator_;
             inplace_stop_source stop_source_;
-            op_queue op_queue_;
+            detail::atomic_intrusive_stack<detail::operation_base> inject_stack_{&detail::operation_base::next_};
+            detail::intrusive_list<detail::operation_base> local_queue_{&detail::operation_base::next_};
+            std::atomic<std::thread::id> owner_{};
+            bool lockfree_inject_ = false;
+            bool park_aware_ = false;
+            std::atomic<bool> parked_{false};
             timer_queue timer_queue_{allocator_};
             std::atomic<std::size_t> work_count_{0};
         };
@@ -457,7 +499,7 @@ namespace coio {
                     }
                 }
 
-                detail::intrusive_list<node> ready_time_ops{&node::next_};
+                detail::intrusive_list<detail::operation_base> ready_time_ops{&detail::operation_base::next_};
                 timer_queue_.take_ready_timers(ready_time_ops);
 
                 lock.unlock();
@@ -477,7 +519,24 @@ namespace coio {
             sema_.release();
         }
 
+        COIO_ALWAYS_INLINE auto consume(bool infinite) -> bool {
+            detail::operation_base* op = infinite ? op_queue_.dequeue() : op_queue_.try_dequeue();
+            if (op) op->finish();
+            return op;
+        }
+
+        COIO_ALWAYS_INLINE auto post_remote(detail::operation_base& n) -> void {
+            op_queue_.enqueue(n);
+            notify();
+        }
+
+        COIO_ALWAYS_INLINE auto shutdown() -> void {
+            interrupt();
+            op_queue_.request_stop();
+        }
+
     private:
+        op_queue op_queue_;
         atomutex bolt_;
         std::counting_semaphore<> sema_{0};
     };

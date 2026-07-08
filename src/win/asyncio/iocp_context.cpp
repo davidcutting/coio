@@ -201,7 +201,8 @@ namespace coio {
             const ::BOOL success = ::GetQueuedCompletionStatus(iocp_, &bytes, &key, &overlapped, static_cast<::DWORD>(timeout));
             const ::DWORD err = success ? 0 : ::GetLastError();
 
-            detail::intrusive_list<node> ready_time_ops{&node::next_}, ready_io_ops{&node::next_};
+            detail::intrusive_list<detail::operation_base> ready_time_ops{&detail::operation_base::next_},
+                ready_io_ops{&detail::operation_base::next_};
             timer_queue_.take_ready_timers(ready_time_ops);
 
             lock.unlock();

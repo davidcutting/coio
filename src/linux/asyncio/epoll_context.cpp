@@ -1,7 +1,6 @@
 // ReSharper disable CppMemberFunctionMayBeConst
 #include <coio/detail/config.h>
 #if COIO_HAS_EPOLL
-#include <ranges>
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -146,7 +145,9 @@ namespace coio {
         epoll_context& context = ctx_;
         cancel();
         {
-            std::scoped_lock _{context.bolt_, data_->fd_lock};
+            // Single-owner: EPOLL_CTL_DEL runs on the owner thread (no concurrent poller), so only the
+            // per-fd lock is needed to serialise against a cross-thread cancel touching in_op/out_op.
+            std::scoped_lock _{data_->fd_lock};
             if (data_->events != 0) {
                 detail::throw_last_error(::epoll_ctl(context.epoll_fd_, EPOLL_CTL_DEL, fd_, nullptr));
             }
@@ -166,11 +167,9 @@ namespace coio {
                 std::exchange(data_->out_op, nullptr)
             };
         }();
-        const std::size_t n = context.op_queue_.bulk_enqueue(ops |
-            std::views::filter(std::identity{}) |
-            std::views::transform([](auto p) noexcept -> auto& { return *p; })
-        );
-        if (n > 0) context.interrupt();
+        for (auto* op : ops) {
+            if (op != nullptr) context.post_node(*op);
+        }
     }
 
     epoll_context::epoll_context(std::pmr::memory_resource& memory_resource): epoll_context(nullptr, memory_resource) {
@@ -185,6 +184,8 @@ namespace coio {
             };
             detail::throw_last_error(::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, interrupter_.watcher(), &event));
         }
+        lockfree_inject_ = true;
+        park_aware_ = true;
     }
 
     epoll_context::~epoll_context() {
@@ -193,21 +194,37 @@ namespace coio {
     }
 
     auto epoll_context::do_one(bool infinite) -> bool {
+        if (owner_.load(std::memory_order_relaxed) == std::thread::id{}) [[unlikely]] {
+            owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        }
         if (work_count_ == 0) return false;
 
         ::epoll_event ready_events[detail::epoll_max_wait_count];
-        while (work_count_ > 0) {
-            if (const auto op = op_queue_.try_dequeue()) {
+        for (;;) {
+            drain_inject();
+            timer_queue_.take_ready_timers(local_queue_);
+
+            if (auto* op = local_queue_.pop_front()) {
                 op->finish();
                 return true;
             }
+            if (work_count_ == 0) return false;
 
-            std::unique_lock lock{bolt_, std::try_to_lock};
-            if (not lock) {
-                return consume(infinite);
+            if (infinite) {
+                // Park protocol (see loop_base::notify): publish that we are about to block, then
+                // re-check the sources a producer may have filled after the checks above. If we find
+                // work, unpublish and handle it; otherwise block with parked_ set so a concurrent
+                // producer sees it and writes the interrupter eventfd.
+                parked_.store(true, std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                drain_inject();
+                timer_queue_.take_ready_timers(local_queue_);
+                if (auto* op = local_queue_.pop_front()) {
+                    parked_.store(false, std::memory_order_relaxed);
+                    op->finish();
+                    return true;
+                }
             }
-
-            if (work_count_ == 0) break;
 
             int timeout = infinite ? -1 : 0;
             if (infinite) {
@@ -220,11 +237,9 @@ namespace coio {
                 }
             }
             const int ready_count = ::epoll_wait(epoll_fd_, ready_events, detail::epoll_max_wait_count, timeout);
+            parked_.store(false, std::memory_order_relaxed);
             if (ready_count == -1 and errno == EINTR) continue;
             detail::throw_last_error(ready_count, "epoll_wait");
-
-            detail::intrusive_list<node> ready_time_ops{&node::next_}, ready_io_ops{&node::next_};
-            timer_queue_.take_ready_timers(ready_time_ops);
 
             for (int i = 0; i < ready_count; ++i) {
                 const auto& [event, data] = ready_events[i];
@@ -245,24 +260,22 @@ namespace coio {
                     auto& op = op_ref.get();
                     if (event & (ev | EPOLLERR | EPOLLHUP)) {
                         if (op == nullptr or not op->perform()) continue;
-                        ready_io_ops.push_back(*op);
+                        local_queue_.push_back(*op);
                         op = nullptr;
                     }
                 }
             }
 
-            lock.unlock();
-
-            if (auto ops = ready_time_ops.release()) op_queue_.enqueue(*ops);
-            if (auto ops = ready_io_ops.release()) op_queue_.enqueue(*ops);
-
             if (not infinite) {
-                const auto op = op_queue_.try_dequeue();
-                if (op) op->finish();
-                return op != nullptr;
+                drain_inject();
+                timer_queue_.take_ready_timers(local_queue_);
+                if (auto* op = local_queue_.pop_front()) {
+                    op->finish();
+                    return true;
+                }
+                return false;
             }
         }
-        return false;
     }
 
     auto epoll_context::new_epoll_data() -> per_fd_data* {

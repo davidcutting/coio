@@ -6,6 +6,9 @@
 #endif
 #include <liburing.h>
 #include <netinet/in.h>
+#include <atomic>
+#include <cstdint>
+#include <thread>
 #include <coio/execution_context.h>
 #include <coio/utils/async_result.h>
 #include <coio/detail/io_descriptions.h>
@@ -24,11 +27,24 @@ namespace coio {
     private:
         // ReSharper disable once CppPolymorphicClassWithNonVirtualPublicDestructor
         struct uring_node : node {
+            // Cancellation coordination. An in-flight op is `active`; the ONLY cross-thread transition
+            // is active -> cancel_queued (a foreign thread requesting cancel), the rest are owner-only,
+            // so a single atomic CAS from `active` is the whole synchronisation. See uring_context::
+            // do_one (classify + drain_cancels) and do_cancel().
+            enum cancel_state : std::uint8_t { active, cancel_queued, drained, completed };
+
             uring_node(uring_context& context) noexcept : node(context) {}
 
             auto do_cancel() -> void;
 
+            // Submit an io_uring cancel targeting this op. OWNER THREAD ONLY (touches the ring).
+            auto submit_cancel() -> void;
+
             virtual auto complete(int cqe_res) -> void = 0;
+
+            std::atomic<std::uint8_t> cancel_state_{active};
+            uring_node* cancel_link_ = nullptr; // intrusive link for uring_context::cancel_stack_
+            bool completion_ready_ = false;     // owner-only: CQE arrived while a cancel was queued
         };
 
     public:
@@ -182,11 +198,21 @@ namespace coio {
 
         auto post_submit_sqes() -> void;
 
+        [[nodiscard]] auto is_owner() const noexcept -> bool {
+            return owner_.load(std::memory_order_relaxed) == std::this_thread::get_id();
+        }
+
+        auto request_cancel(uring_node& node) -> void;
+
+        auto drain_cancels() -> void;
+
     private:
-        atomutex uring_mtx_;
-        atomutex bolt_;
         std::size_t pending_sqes_ = 0;
+        bool enabled_ = false;
         ::io_uring uring_{};
+        // Cancel requests are drained by the owner so cancel SQEs are only ever submitted by the single
+        // issuer. Threaded on uring_node::cancel_link_ (distinct from the run-queue next_).
+        detail::atomic_intrusive_stack<uring_node> cancel_stack_{&uring_node::cancel_link_};
     };
 
     namespace detail {
@@ -240,7 +266,6 @@ namespace coio {
             }
             
             auto do_start() noexcept -> bool {
-                std::scoped_lock _{context_.uring_mtx_};
                 auto sqe = context_.allocate_sqe();
                 if (sqe == nullptr) {
                     result.set_error(std::make_error_code(std::errc::no_buffer_space));

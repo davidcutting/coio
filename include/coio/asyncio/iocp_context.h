@@ -237,8 +237,25 @@ namespace coio {
 
         auto interrupt() -> void;
 
+        COIO_ALWAYS_INLINE auto consume(bool infinite) -> bool {
+            detail::operation_base* op = infinite ? op_queue_.dequeue() : op_queue_.try_dequeue();
+            if (op) op->finish();
+            return op;
+        }
+
+        COIO_ALWAYS_INLINE auto post_remote(detail::operation_base& n) -> void {
+            op_queue_.enqueue(n);
+            notify();
+        }
+
+        COIO_ALWAYS_INLINE auto shutdown() -> void {
+            interrupt();
+            op_queue_.request_stop();
+        }
+
     private:
         ::HANDLE iocp_;
+        op_queue op_queue_;
         atomutex bolt_;
     };
 

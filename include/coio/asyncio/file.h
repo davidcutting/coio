@@ -153,14 +153,16 @@ namespace coio {
         template<io_scheduler IoScheduler>
         class file_base {
         private:
-            using implementation_type = decltype(std::declval<IoScheduler&>().make_io_object(std::declval<file_native_handle_type>()));
+            using implementation_type = decltype(std::declval<IoScheduler&>().make_io_object(std::declval<typename IoScheduler::native_handle_type>()));
 
         public:
-            using native_handle_type = file_native_handle_type;
+            // The backend's opaque handle (same one the socket facade uses). Reach the raw fd for the
+            // blocking file syscalls via the explicit detail::to_native() escape hatch.
+            using native_handle_type = typename IoScheduler::native_handle_type;
             using scheduler_type = IoScheduler;
 
         public:
-            explicit file_base(scheduler_type scheduler) noexcept : file_base(std::move(scheduler), invalid_file_handle) {}
+            explicit file_base(scheduler_type scheduler) noexcept : file_base(std::move(scheduler), native_handle_type{}) {}
 
             file_base(scheduler_type scheduler, native_handle_type handle) : impl_(scheduler.make_io_object(handle)) {}
 
@@ -193,7 +195,7 @@ namespace coio {
              * \throw std::system_error on failure.
              */
             COIO_ALWAYS_INLINE auto close() -> void {
-                close_file(release());
+                close_file(detail::to_native(release()));
             }
 
             /**
@@ -223,7 +225,7 @@ namespace coio {
              * \return The native file handle.
              */
             [[nodiscard]]
-            COIO_ALWAYS_INLINE auto native_handle() const noexcept -> file_native_handle_type {
+            COIO_ALWAYS_INLINE auto native_handle() const noexcept -> native_handle_type {
                 return impl_.native_handle();
             }
 
@@ -233,7 +235,7 @@ namespace coio {
              */
             [[nodiscard]]
             COIO_ALWAYS_INLINE auto is_open() const noexcept -> bool {
-                return native_handle() != invalid_file_handle;
+                return native_handle() != native_handle_type{};
             }
 
             /**
@@ -272,7 +274,7 @@ namespace coio {
                     return this->impl_.file_read(buffer);
                 }
                 else {
-                    return detail::file_read(this->native_handle(), buffer);
+                    return detail::file_read(detail::to_native(this->native_handle()), buffer);
                 }
             }
 
@@ -315,7 +317,7 @@ namespace coio {
                     return this->impl_.file_write(buffer);
                 }
                 else {
-                    return detail::file_write(this->native_handle(), buffer);
+                    return detail::file_write(detail::to_native(this->native_handle()), buffer);
                 }
             }
 
@@ -349,7 +351,7 @@ namespace coio {
              * \throw std::system_error on failure.
              */
             COIO_ALWAYS_INLINE auto read_some_at(std::size_t offset, std::span<std::byte> buffer) -> std::size_t {
-                return detail::file_read_at(this->native_handle(), offset, buffer);
+                return detail::file_read_at(detail::to_native(this->native_handle()), offset, buffer);
             }
 
             /**
@@ -394,7 +396,7 @@ namespace coio {
              * \throw std::system_error on failure.
              */
             COIO_ALWAYS_INLINE auto write_some_at(std::size_t offset, std::span<const std::byte> buffer) -> std::size_t {
-                return detail::file_write_at(this->native_handle(), offset, buffer);
+                return detail::file_write_at(detail::to_native(this->native_handle()), offset, buffer);
             }
 
             /**
@@ -471,7 +473,7 @@ namespace coio {
          */
         COIO_ALWAYS_INLINE auto open(zstring_view path, detail::open_mode mode) -> void {
             if (this->is_open()) throw std::system_error{error::already_open, "open"};
-            this->impl_ = this->get_io_scheduler().make_io_object(detail::open_file(path, mode, false));
+            this->impl_ = this->get_io_scheduler().make_io_object(detail::to_handle(detail::open_file(path, mode, false)));
         }
 
         /**
@@ -484,7 +486,7 @@ namespace coio {
                 return this->impl_.file_resize(new_size);
             }
             else {
-                return detail::file_resize(this->native_handle(), new_size);
+                return detail::file_resize(detail::to_native(this->native_handle()), new_size);
             }
         }
 
@@ -495,7 +497,7 @@ namespace coio {
          */
         [[nodiscard]]
         COIO_ALWAYS_INLINE  auto size() const -> std::size_t {
-            return detail::file_size(this->native_handle());
+            return detail::file_size(detail::to_native(this->native_handle()));
         }
 
         /**
@@ -513,7 +515,7 @@ namespace coio {
                 return this->impl_.file_seek(offset, whence);
             }
             else {
-                return detail::file_seek(this->native_handle(), offset, whence);
+                return detail::file_seek(detail::to_native(this->native_handle()), offset, whence);
             }
         }
 
@@ -525,7 +527,7 @@ namespace coio {
          * \throw std::system_error on failure.
          */
         COIO_ALWAYS_INLINE auto sync_all() -> void {
-            detail::file_sync_all(this->native_handle());
+            detail::file_sync_all(detail::to_native(this->native_handle()));
         }
 
         /**
@@ -536,7 +538,7 @@ namespace coio {
          * \throw std::system_error on failure.
          */
         COIO_ALWAYS_INLINE auto sync_data() -> void {
-            detail::file_sync_data(this->native_handle());
+            detail::file_sync_data(detail::to_native(this->native_handle()));
         }
     };
 
@@ -598,7 +600,7 @@ namespace coio {
          */
         COIO_ALWAYS_INLINE auto open(zstring_view path, detail::open_mode mode) -> void {
             if (this->is_open()) throw std::system_error{error::already_open, "open"};
-            this->impl_ = this->get_io_scheduler().make_io_object(detail::open_file(path, mode, true));
+            this->impl_ = this->get_io_scheduler().make_io_object(detail::to_handle(detail::open_file(path, mode, true)));
         }
 
         /**
@@ -611,7 +613,7 @@ namespace coio {
                 return this->impl_.file_resize(new_size);
             }
             else {
-                return detail::file_resize(this->native_handle(), new_size);
+                return detail::file_resize(detail::to_native(this->native_handle()), new_size);
             }
         }
 
@@ -622,7 +624,7 @@ namespace coio {
          */
         [[nodiscard]]
         COIO_ALWAYS_INLINE  auto size() const -> std::size_t {
-            return detail::file_size(this->native_handle());
+            return detail::file_size(detail::to_native(this->native_handle()));
         }
 
         /**
@@ -633,7 +635,7 @@ namespace coio {
          * \throw std::system_error on failure.
          */
         COIO_ALWAYS_INLINE auto sync_all() -> void {
-            detail::file_sync_all(this->native_handle());
+            detail::file_sync_all(detail::to_native(this->native_handle()));
         }
 
         /**
@@ -644,7 +646,7 @@ namespace coio {
          * \throw std::system_error on failure.
          */
         COIO_ALWAYS_INLINE auto sync_data() -> void {
-            detail::file_sync_data(this->native_handle());
+            detail::file_sync_data(detail::to_native(this->native_handle()));
         }
     };
 }

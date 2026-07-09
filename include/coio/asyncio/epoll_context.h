@@ -18,7 +18,6 @@
 #include <coio/detail/io_descriptions.h>
 
 namespace coio {
-    struct epoll_cap {};
 
     template<typename Executor>
     class epoll_scheduler;
@@ -59,7 +58,8 @@ namespace coio {
         friend class detail::epoll_state_base_for;
 
     public:
-        using capability = epoll_cap;
+        // io via epoll readiness; timer via a per-op timerfd (epoll_scheduler::sleep_sender).
+        using capabilities = type_list<capability::io, capability::timer>;
         template<typename Executor>
         using scheduler_of = epoll_scheduler<Executor>;
 
@@ -171,6 +171,8 @@ namespace coio {
 
     public:
         using scheduler_concept = detail::io_scheduler_tag;
+        // Opaque handle for this backend. epoll always holds a real fd, so the codec is identity forever.
+        using native_handle_type = detail::native_handle;
         using base::base;
 
         // Internal, facaded by socket/file (held as their impl_). Precondition: the owning facade — and
@@ -199,19 +201,20 @@ namespace coio {
             friend auto swap(io_object& a, io_object& b) noexcept -> void { a.swap(b); }
 
             [[nodiscard]] auto get_io_scheduler() const noexcept -> epoll_scheduler { return epoll_scheduler{*ctx_}; }
-            [[nodiscard]] auto native_handle() const noexcept -> int { return fd_; }
+            // Public accessors speak the opaque handle; fd_ stays a backend-internal detail (epoll ops read it).
+            [[nodiscard]] auto native_handle() const noexcept -> detail::native_handle { return detail::to_handle(fd_); }
 
-            auto release() -> int {
-                if (fd_ == -1) return -1;
+            auto release() -> detail::native_handle {
+                if (fd_ == -1) return {};
                 reclaim(cancel());
-                return std::exchange(fd_, -1);
+                return detail::to_handle(std::exchange(fd_, -1));
             }
             // Teardown deregisters any in-flight ops and posts them (as stopped) via our own executor.
             // Returns whether any live op was pulled (its stop callback is still armed until finish() runs).
             auto cancel() -> bool {
                 if (fd_ == -1) return false;
                 bool had_ops = false;
-                for (auto* op : ctx_->template get_driver<epoll_cap>().cancel_all(data_)) {
+                for (auto* op : ctx_->template get_driver<capability::io>().cancel_all(data_)) {
                     if (op != nullptr) { ctx_->submit(*op); had_ops = true; }
                 }
                 return had_ops;
@@ -228,7 +231,7 @@ namespace coio {
             // owner's event drain), so every reader sees a VALID data_ and backs off. release_fd's
             // EPOLL_CTL_DEL first stops any NEW events. On-owner + idle has no such reader -> free inline.
             auto reclaim(bool had_ops) -> void {
-                if (fd_ != -1) ctx_->template get_driver<epoll_cap>().release_fd(fd_, data_);
+                if (fd_ != -1) ctx_->template get_driver<capability::io>().release_fd(fd_, data_);
                 if (had_ops or not ctx_->is_owner())
                     detail::defer_to_owner(*ctx_, [ctx = ctx_, d = data_] { ctx->get_allocator().delete_object(d); });
                 else
@@ -254,7 +257,7 @@ namespace coio {
                 static constexpr bool coio_unstoppable = not Stoppable;
 
                 state_base(Executor& ctx, int fd, epoll_driver::per_fd_data* data, Sexpr sexpr, Rcvr rcvr) noexcept
-                    : detail::epoll_state_base_for<Sexpr>(fd, ctx.template get_driver<epoll_cap>(), data, std::move(sexpr)),
+                    : detail::epoll_state_base_for<Sexpr>(fd, ctx.template get_driver<capability::io>(), data, std::move(sexpr)),
                       context_(ctx), rcvr_(std::move(rcvr)) {}
                 COIO_ALWAYS_INLINE auto do_finish(bool) noexcept -> void { this->result.forward_to(std::move(rcvr_)); }
                 // Uniform across all io Sexprs: deregister the event we registered, and if we were still
@@ -285,7 +288,7 @@ namespace coio {
             Sexpr sexpr;
         };
 
-        [[nodiscard]] auto make_io_object(int fd) const -> io_object { return io_object{*this->ctx_, fd}; }
+        [[nodiscard]] auto make_io_object(detail::native_handle handle) const -> io_object { return io_object{*this->ctx_, detail::to_native(handle)}; }
 
         // Stoppable=false skips the per-op shutdown stop-hook; see uring_scheduler::schedule_io. Valid
         // only for ops that complete promptly regardless of the peer (datagram send).
@@ -306,7 +309,7 @@ namespace coio {
             template<typename Rcvr>
             struct state_base : epoll_driver::operation {
                 state_base(Executor& ctx, std::chrono::steady_clock::time_point when, Rcvr rcvr) noexcept
-                    : epoll_driver::operation(ctx.template get_driver<epoll_cap>(), -1, &own_data_),
+                    : epoll_driver::operation(ctx.template get_driver<capability::io>(), -1, &own_data_),
                       context_(ctx), when_(when), rcvr_(std::move(rcvr)) {}
                 ~state_base() { if (this->fd != -1) detail::epoll_close_timer(driver_.epoll_fd(), this->fd); }
 

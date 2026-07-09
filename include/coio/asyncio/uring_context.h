@@ -23,9 +23,6 @@
 #include <coio/detail/io_descriptions.h>
 
 namespace coio {
-    // Capability tag: an executor owning a uring_driver can do io + timers.
-    struct uring_cap {};
-
     template<typename Executor>
     class uring_scheduler;
 
@@ -47,7 +44,8 @@ namespace coio {
         friend class detail::uring_state_base_for;
 
     public:
-        using capability = uring_cap;
+        // io via ring SQEs; timer via the native timeout op (async_sleep_t).
+        using capabilities = type_list<capability::io, capability::timer>;
         template<typename Executor>
         using scheduler_of = uring_scheduler<Executor>;
 
@@ -63,12 +61,13 @@ namespace coio {
             auto submit_cancel() -> void;     // OWNER thread only (touches the ring)
 
             virtual auto prepare(::io_uring_sqe* sqe) noexcept -> void = 0;   // Sexpr-specialized (in the .cpp)
-            virtual auto complete(int cqe_res) -> void = 0;
 
-            // Per-CQE hook the driver calls from classify(). Returns true when the op is FINISHED (drive it
-            // to the ready queue and free it), false when it stays armed for more CQEs (multishot). Default
-            // = single-shot: deliver once and finish. `flags` carries IORING_CQE_F_MORE/F_BUFFER + buffer id.
-            virtual auto on_completion(int cqe_res, unsigned /*cqe_flags*/) -> bool { complete(cqe_res); return true; }
+            // The one completion hook the driver calls from classify() per CQE. Returns true when the op is
+            // FINISHED (drive it to the ready queue and free it), false when it stays armed for more CQEs
+            // (multishot). `cqe_flags` carries IORING_CQE_F_MORE/F_BUFFER + buffer id — used only by
+            // multishot; single-shot ops ignore it and always return true. Folding the finished/armed signal
+            // into the return type means a handler can't forget to state which it is.
+            virtual auto on_completion(int cqe_res, unsigned cqe_flags) -> bool = 0;
 
             uring_driver& driver_; // NOLINT(*-avoid-const-or-ref-data-members)
             std::atomic<std::uint8_t> cancel_state_{active};
@@ -177,7 +176,9 @@ namespace coio {
                 return true;
             }
 
-            auto complete(int cqe_res) -> void override {
+            // Generic single-shot completion: deliver the result once, always finished. Ignores cqe_flags
+            // (only multishot reads them). Specialized in the .cpp for ops with a richer result.
+            auto on_completion(int cqe_res, unsigned /*cqe_flags*/) -> bool override {
                 if (cqe_res < 0) {
                     const std::error_code ec{-cqe_res, std::system_category()};
                     if (ec == std::errc::operation_canceled) result.set_stopped();
@@ -187,6 +188,7 @@ namespace coio {
                     if constexpr (std::same_as<typename Sexpr::value_signature, execution::set_value_t()>) result.set_value();
                     else result.set_value(cqe_res);
                 }
+                return true;
             }
 
         protected:
@@ -202,13 +204,14 @@ namespace coio {
         template<> auto uring_state_base_for<async_receive_t>::prepare(::io_uring_sqe*) noexcept -> void;
         template<> auto uring_state_base_for<async_send_t>::prepare(::io_uring_sqe*) noexcept -> void;
         template<> auto uring_state_base_for<async_receive_from_t>::prepare(::io_uring_sqe*) noexcept -> void;
-        template<> auto uring_state_base_for<async_receive_from_t>::complete(int) -> void;
+        template<> auto uring_state_base_for<async_receive_from_t>::on_completion(int, unsigned) -> bool;
         template<> auto uring_state_base_for<async_send_to_t>::prepare(::io_uring_sqe*) noexcept -> void;
         template<> auto uring_state_base_for<async_accept_t>::prepare(::io_uring_sqe*) noexcept -> void;
+        template<> auto uring_state_base_for<async_accept_t>::on_completion(int, unsigned) -> bool; // wraps the minted fd -> native_handle
         template<> auto uring_state_base_for<async_connect_t>::prepare(::io_uring_sqe*) noexcept -> void;
         // A1 timer: TIMEOUT SQE + -ETIME-as-success completion.
         template<> auto uring_state_base_for<async_sleep_t>::prepare(::io_uring_sqe*) noexcept -> void;
-        template<> auto uring_state_base_for<async_sleep_t>::complete(int) -> void;
+        template<> auto uring_state_base_for<async_sleep_t>::on_completion(int, unsigned) -> bool;
     }
 
     // Caller-managed provided-buffer ring for multishot receive (io_uring bufring). The kernel pulls a
@@ -220,7 +223,7 @@ namespace coio {
     class buffer_ring {
     public:
         buffer_ring(executor<uring_driver>& ctx, unsigned count, unsigned buffer_size, int bgid)
-            : ring_(ctx.get_driver<uring_cap>().get_uring()),
+            : ring_(ctx.get_driver<capability::io>().get_uring()),
               storage_(std::make_unique<std::byte[]>(static_cast<std::size_t>(count) * buffer_size)),
               count_(count), buffer_size_(buffer_size),
               mask_(::io_uring_buf_ring_mask(count)), bgid_(bgid) {
@@ -273,6 +276,9 @@ namespace coio {
 
     public:
         using scheduler_concept = detail::io_scheduler_tag;
+        // The opaque handle this backend hands out. Identity codec today (bits == fd); becomes a registered
+        // fixed-file index when that lands, with no change to any facade. See detail::native_handle.
+        using native_handle_type = detail::native_handle;
         // The provided-buffer group type for multishot receive. Naming it here (rather than the concrete
         // buffer_ring) lets the generic socket facade take `typename IoScheduler::buffer_group&` without
         // depending on any uring type — backends without multishot simply don't define it.
@@ -303,12 +309,14 @@ namespace coio {
                 COIO_ASSERT(ctx_ != nullptr);
                 return uring_scheduler{*ctx_};
             }
-            [[nodiscard]] auto native_handle() const noexcept -> int { return fd_; }
+            // Public accessors speak the opaque handle; the raw fd_ stays a backend-internal detail that
+            // the io_sender reads directly (it holds `int fd`) and prepare() feeds to the ring.
+            [[nodiscard]] auto native_handle() const noexcept -> detail::native_handle { return detail::to_handle(fd_); }
 
-            auto release() -> int { cancel(); return std::exchange(fd_, -1); }
+            auto release() -> detail::native_handle { cancel(); return detail::to_handle(std::exchange(fd_, -1)); }
             auto cancel() -> void {
                 if (fd_ == -1) return;
-                auto& driver = ctx_->template get_driver<uring_cap>();
+                auto& driver = ctx_->template get_driver<capability::io>();
                 // Reaping in-flight ops submits a cancel SQE -> owner only (the single issuer).
                 if (ctx_->is_owner()) {
                     driver.cancel_fd(fd_);
@@ -346,7 +354,7 @@ namespace coio {
                 static constexpr bool coio_unstoppable = not Stoppable;
 
                 state_base(Executor& ctx, int fd, std::atomic<int>* inflight, Sexpr sexpr, Rcvr rcvr) noexcept
-                    : detail::uring_state_base_for<Sexpr>(fd, ctx.template get_driver<uring_cap>(), std::move(sexpr)),
+                    : detail::uring_state_base_for<Sexpr>(fd, ctx.template get_driver<capability::io>(), std::move(sexpr)),
                       context_(ctx), inflight_(inflight), rcvr_(std::move(rcvr)) {}
 
                 // inflight_ tracks live ops on the io_object's fd so its teardown can skip the ring when
@@ -390,8 +398,8 @@ namespace coio {
             Sexpr sexpr;
         };
 
-        [[nodiscard]] auto make_io_object(int fd) const -> io_object {
-            return io_object{*this->ctx_, fd};
+        [[nodiscard]] auto make_io_object(detail::native_handle handle) const -> io_object {
+            return io_object{*this->ctx_, detail::to_native(handle)}; // decode at the boundary; internals hold the fd
         }
 
         // Stoppable=false skips the per-op shutdown stop-hook. Only valid for ops that complete
@@ -421,7 +429,7 @@ namespace coio {
             template<typename Rcvr>
             struct state_base : uring_driver::operation {
                 state_base(Executor& ctx, int fd, std::atomic<int>* inflight, buffer_ring* bufs, Sink sink, Rcvr rcvr) noexcept
-                    : uring_driver::operation(ctx.template get_driver<uring_cap>()),
+                    : uring_driver::operation(ctx.template get_driver<capability::io>()),
                       context_(ctx), fd_(fd), inflight_(inflight), bufs_(bufs), sink_(std::move(sink)),
                       rcvr_(std::move(rcvr)) {}
 
@@ -430,7 +438,6 @@ namespace coio {
                     sqe->buf_group = static_cast<unsigned short>(bufs_->bgid());
                     sqe->flags |= IOSQE_BUFFER_SELECT;
                 }
-                auto complete(int) -> void override { coio::unreachable(); } // multishot uses on_completion
 
                 auto on_completion(int res, unsigned flags) -> bool override {
                     if (res >= 0) {

@@ -241,12 +241,14 @@ namespace coio {
     template<typename Protocol, io_scheduler IoScheduler>
     class basic_socket {
     private:
-        using implementation_type = decltype(std::declval<IoScheduler&>().make_io_object(std::declval<detail::socket_native_handle_type>()));
+        using implementation_type = decltype(std::declval<IoScheduler&>().make_io_object(std::declval<typename IoScheduler::native_handle_type>()));
 
     public:
         using protocol_type = Protocol;
         using scheduler_type = IoScheduler;
-        using native_handle_type = detail::socket_native_handle_type;
+        // The opaque handle is the backend's to define; the facade never assumes it is an fd. Reach the raw
+        // OS primitive (for options coio doesn't wrap) via the explicit detail::to_native() escape hatch.
+        using native_handle_type = typename IoScheduler::native_handle_type;
         using shutdown_type = detail::socket::shutdown_type;
         using enum shutdown_type;
 
@@ -268,7 +270,7 @@ namespace coio {
 
     public:
         explicit basic_socket(scheduler_type scheduler) noexcept :
-            basic_socket(std::move(scheduler), detail::invalid_socket_handle) {}
+            basic_socket(std::move(scheduler), native_handle_type{}) {}
 
         basic_socket(scheduler_type scheduler, native_handle_type handle) :
             impl_(scheduler.make_io_object(handle)) {}
@@ -310,14 +312,14 @@ namespace coio {
         */
         COIO_ALWAYS_INLINE auto open(const protocol_type& protocol = protocol_type()) -> void {
             if (is_open()) throw std::system_error{error::already_open, "open"};
-            impl_ = get_io_scheduler().make_io_object(detail::socket::open(protocol.family(), protocol.type(), protocol.protocol_id()));
+            impl_ = get_io_scheduler().make_io_object(detail::to_handle(detail::socket::open(protocol.family(), protocol.type(), protocol.protocol_id())));
         }
 
         /**
          * \brief close the socket. Any asynchronous send, receive or connect operations will be cancelled immediately.
          */
         COIO_ALWAYS_INLINE auto close() -> void {
-            detail::socket::close(release());
+            detail::socket::close(detail::to_native(release()));
         }
 
         /**
@@ -343,7 +345,7 @@ namespace coio {
          * \throw std::system_error on failure.
          */
         COIO_ALWAYS_INLINE auto shutdown(shutdown_type how) -> void {
-            return detail::socket::shutdown(native_handle(), how);
+            return detail::socket::shutdown(detail::to_native(native_handle()), how);
         }
 
         /**
@@ -351,7 +353,7 @@ namespace coio {
          */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto is_open() const noexcept -> bool {
-            return native_handle() != detail::invalid_socket_handle;
+            return native_handle() != native_handle_type{};
         }
 
 
@@ -367,7 +369,7 @@ namespace coio {
          */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto local_endpoint() const -> endpoint {
-            return detail::socket::local_endpoint(native_handle());
+            return detail::socket::local_endpoint(detail::to_native(native_handle()));
         }
 
         /**
@@ -375,7 +377,7 @@ namespace coio {
          */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto remote_endpoint() const -> endpoint {
-            return detail::socket::remote_endpoint(native_handle());
+            return detail::socket::remote_endpoint(detail::to_native(native_handle()));
         }
 
         /**
@@ -383,7 +385,7 @@ namespace coio {
          */
         template<typename SocketOption>
         COIO_ALWAYS_INLINE auto set_option(const SocketOption& option) -> void {
-            detail::socket::set_sockopt(native_handle(), option.level(), option.name(), option.data());
+            detail::socket::set_sockopt(detail::to_native(native_handle()), option.level(), option.name(), option.data());
         }
 
         /**
@@ -391,7 +393,7 @@ namespace coio {
          */
         template<typename SocketOption>
         COIO_ALWAYS_INLINE auto get_option(SocketOption& option) const -> void {
-            detail::socket::get_sockopt(native_handle(), option.level(), option.name(), option.data());
+            detail::socket::get_sockopt(detail::to_native(native_handle()), option.level(), option.name(), option.data());
         }
 
         /**
@@ -400,7 +402,7 @@ namespace coio {
          * \throw std::system_error on failure.
          */
         COIO_ALWAYS_INLINE auto bind(const endpoint& local_endpoint) -> void {
-            detail::socket::bind(native_handle(), local_endpoint);
+            detail::socket::bind(detail::to_native(native_handle()), local_endpoint);
         }
 
         /**
@@ -410,7 +412,7 @@ namespace coio {
         */
         COIO_ALWAYS_INLINE auto connect(const endpoint& peer) -> void {
             if (not is_open()) open();
-            detail::socket::connect(native_handle(), peer);
+            detail::socket::connect(detail::to_native(native_handle()), peer);
         }
 
         /**
@@ -471,7 +473,7 @@ namespace coio {
          * \throw std::system_error on failure.
          */
         COIO_ALWAYS_INLINE auto listen(std::size_t backlog = max_backlog()) -> void {
-           detail::socket::listen(this->native_handle(), backlog);
+           detail::socket::listen(detail::to_native(this->native_handle()), backlog);
         }
 
         /**
@@ -493,7 +495,8 @@ namespace coio {
         template<io_scheduler OtherScheduler>
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto accept(OtherScheduler peer_scheduler) -> protocol_socket_<OtherScheduler> {
-            return protocol_socket_<OtherScheduler>(peer_scheduler, detail::socket::accept(this->native_handle()));
+            // Sync accept: unwrap to the raw fd for the blocking syscall, re-wrap its minted fd into a handle.
+            return protocol_socket_<OtherScheduler>(peer_scheduler, detail::to_handle(detail::socket::accept(detail::to_native(this->native_handle()))));
         }
 
         /**
@@ -585,7 +588,7 @@ namespace coio {
         */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto read_some(std::span<std::byte> buffer) -> std::size_t {
-            const auto bytes_transferred = detail::socket::receive(this->native_handle(), buffer);
+            const auto bytes_transferred = detail::socket::receive(detail::to_native(this->native_handle()), buffer);
             if (bytes_transferred == 0 and not buffer.empty()) [[unlikely]] throw std::system_error{error::eof, "read_some"};
             return bytes_transferred;
         }
@@ -599,7 +602,7 @@ namespace coio {
         */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto write_some(std::span<const std::byte> buffer) -> std::size_t {
-            return detail::socket::send(this->native_handle(), buffer);
+            return detail::socket::send(detail::to_native(this->native_handle()), buffer);
         }
 
         /**
@@ -705,7 +708,7 @@ namespace coio {
         */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto receive(std::span<std::byte> buffer) -> std::size_t {
-            return detail::socket::receive(this->native_handle(), buffer);
+            return detail::socket::receive(detail::to_native(this->native_handle()), buffer);
         }
 
         /**
@@ -716,7 +719,7 @@ namespace coio {
         */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto send(std::span<const std::byte> buffer) -> std::size_t {
-            return detail::socket::send(this->native_handle(), buffer);
+            return detail::socket::send(detail::to_native(this->native_handle()), buffer);
         }
 
         /**
@@ -727,7 +730,7 @@ namespace coio {
         */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto receive_from(std::span<std::byte> buffer) -> std::pair<endpoint, std::size_t> {
-            return detail::socket::receive_from(this->native_handle(), buffer);
+            return detail::socket::receive_from(detail::to_native(this->native_handle()), buffer);
         }
 
         /**
@@ -739,7 +742,7 @@ namespace coio {
         */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto send_to(std::span<const std::byte> buffer, const endpoint& peer) -> std::size_t {
-            return detail::socket::send_to(this->native_handle(), buffer, peer);
+            return detail::socket::send_to(detail::to_native(this->native_handle()), buffer, peer);
         }
 
         /**

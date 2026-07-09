@@ -37,10 +37,12 @@ namespace coio {
                 WriterIoScheduler sched2,
                 file_native_handle_type writer_handle
             ) COIO_STATIC_CALL_OP_CONST -> std::pair<pipe_reader<ReaderIoScheduler>, pipe_writer<WriterIoScheduler>> {
+                // reader/writer_handle are freshly-minted raw fds (from make_native_pipe or the caller);
+                // wrap each into the backend's opaque handle for the file_base ctor.
                 return {
                     std::piecewise_construct,
-                    std::forward_as_tuple(std::move(sched1), reader_handle),
-                    std::forward_as_tuple(std::move(sched2), writer_handle)
+                    std::forward_as_tuple(std::move(sched1), to_handle(reader_handle)),
+                    std::forward_as_tuple(std::move(sched2), to_handle(writer_handle))
                 };
             }
 

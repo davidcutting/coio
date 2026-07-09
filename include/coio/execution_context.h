@@ -236,7 +236,7 @@ namespace coio {
 
         template<typename Cap>
         static constexpr bool has_capability =
-            std::same_as<Cap, typename WaitDrv::capability> or (std::same_as<Cap, typename Rest::capability> or ...);
+            WaitDrv::capabilities::template contains<Cap> or (Rest::capabilities::template contains<Cap> or ...);
 
         template<typename Cap>
         [[nodiscard]] COIO_ALWAYS_INLINE auto get_driver() noexcept -> auto& {
@@ -262,8 +262,14 @@ namespace coio {
             if (parked_.load(std::memory_order_relaxed)) wait_driver().wake_up();
         }
 
-        COIO_ALWAYS_INLINE auto work_started() noexcept -> void { ++work_count_; }
-        COIO_ALWAYS_INLINE auto work_finished() noexcept -> void { if (--work_count_ == 0) wake_up(); }
+        // Relaxed RMW: the counter is only a "should I consider exiting" gate, re-validated under the park
+        // protocol. It carries no synchronization itself — the actual work delivery + wakeup rides
+        // submit()/inject_stack + wake_up(), which already has a seq_cst fence. fetch_sub returns the prior
+        // value, so ==1 means it just hit 0.
+        COIO_ALWAYS_INLINE auto work_started() noexcept -> void { work_count_.fetch_add(1, std::memory_order_relaxed); }
+        COIO_ALWAYS_INLINE auto work_finished() noexcept -> void {
+            if (work_count_.fetch_sub(1, std::memory_order_relaxed) == 1) wake_up();
+        }
 
         COIO_ALWAYS_INLINE auto request_stop() -> void {
             if (stop_source_.request_stop()) wake_up();
@@ -317,13 +323,14 @@ namespace coio {
 
         template<typename Cap, std::size_t... I>
         [[nodiscard]] COIO_ALWAYS_INLINE auto driver_for(std::index_sequence<I...>) noexcept -> auto& {
-            // Return the first driver whose capability == Cap. Exactly one matches (has_capability).
+            // Return the FIRST driver (declaration order) providing Cap. Several may provide it —
+            // has_capability only guarantees at least one; earlier drivers win capability disputes.
             return pick<Cap, I...>();
         }
         template<typename Cap, std::size_t I, std::size_t... Rest2>
         [[nodiscard]] COIO_ALWAYS_INLINE auto pick() noexcept -> auto& {
             using D = std::tuple_element_t<I, std::tuple<WaitDrv, Rest...>>;
-            if constexpr (std::same_as<Cap, typename D::capability>) return std::get<I>(drivers_);
+            if constexpr (D::capabilities::template contains<Cap>) return std::get<I>(drivers_);
             else return pick<Cap, Rest2...>();
         }
 

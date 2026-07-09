@@ -15,12 +15,48 @@
 
 namespace coio {
     namespace detail {
+        // The raw OS primitive. Spoken only by the platform syscall layer (detail::socket::*) and the
+        // kernel-mint boundary (open/accept/socket returning a fresh fd). Everything above the backend
+        // traffics in the opaque native_handle instead.
 #if COIO_OS_LINUX
-        using socket_native_handle_type = int;
+        using native_fd = int;
 #elif COIO_OS_WINDOWS
-        using socket_native_handle_type = ::UINT_PTR;
+        using native_fd = ::UINT_PTR;
 #endif
-        inline constexpr socket_native_handle_type invalid_socket_handle = socket_native_handle_type(-1);
+        // Transitional alias: some layers still name this while the facades are being swept to native_handle.
+        using socket_native_handle_type = native_fd;
+        inline constexpr native_fd invalid_socket_handle = native_fd(-1);
+
+        // Opaque, backend-owned handle. One type per platform; each io_scheduler aliases it as its
+        // native_handle_type. The backend codec (handle_access, identity today) maps native_handle <-> the
+        // raw native_fd. Fixed-file support later swaps only the codec (fd -> registered index), leaving
+        // this type and every facade untouched. The only way to the raw fd is the explicit to_native() hatch.
+        class native_handle {
+        public:
+            constexpr native_handle() noexcept = default;
+            friend constexpr auto operator== (native_handle, native_handle) noexcept -> bool = default;
+
+        private:
+            explicit constexpr native_handle(std::uintptr_t bits) noexcept : bits_(bits) {}
+            std::uintptr_t bits_ = static_cast<std::uintptr_t>(-1); // empty == the invalid fd (-1 / INVALID_SOCKET)
+            friend struct handle_access;
+        };
+
+        struct handle_access {
+            // Identity codec: the handle's bits ARE the raw fd (sign-extended). fd -1 <-> the empty handle,
+            // so a default-constructed native_handle round-trips to the invalid fd (== invalid_socket_handle).
+            static constexpr auto to_handle(native_fd fd) noexcept -> native_handle {
+                return native_handle{static_cast<std::uintptr_t>(static_cast<std::intptr_t>(fd))};
+            }
+            static constexpr auto to_native(native_handle h) noexcept -> native_fd {
+                return static_cast<native_fd>(static_cast<std::intptr_t>(h.bits_));
+            }
+        };
+
+        // Explicit escape hatch: reach the raw fd from an opaque handle (and back). Callers that need the OS
+        // primitive (unwrapped syscalls, backend prepare()) go through here; ordinary facade code never does.
+        [[nodiscard]] constexpr auto to_native(native_handle h) noexcept -> native_fd { return handle_access::to_native(h); }
+        [[nodiscard]] constexpr auto to_handle(native_fd fd) noexcept -> native_handle { return handle_access::to_handle(fd); }
     }
 
     class ipv4_address {

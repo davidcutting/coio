@@ -312,7 +312,7 @@ namespace coio {
         template<> auto epoll_state_base_for<async_accept_t>::do_perform() noexcept -> bool {
             auto accepted_ = ::accept4(fd, nullptr, nullptr, SOCK_NONBLOCK);
             if (accepted_ == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
-            else result.set_value(accepted_);
+            else result.set_value(to_handle(accepted_)); // wrap the minted fd at the mint site (same boundary as uring)
             return true;
         }
 

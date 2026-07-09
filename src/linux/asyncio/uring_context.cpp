@@ -242,19 +242,31 @@ namespace coio {
         template<> auto uring_state_base_for<async_receive_from_t>::prepare(::io_uring_sqe* sqe) noexcept -> void {
             ::io_uring_prep_recvmsg(sqe, fd, &msg, 0);
         }
-        template<> auto uring_state_base_for<async_receive_from_t>::complete(int cqe_res) -> void {
+        template<> auto uring_state_base_for<async_receive_from_t>::on_completion(int cqe_res, unsigned) -> bool {
             if (cqe_res < 0) {
                 const std::error_code ec{-cqe_res, std::system_category()};
                 if (ec == std::errc::operation_canceled) result.set_stopped();
                 else result.set_error(ec);
             }
             else result.set_value(sockaddr_storage_to_endpoint(peer), cqe_res);
+            return true;
         }
         template<> auto uring_state_base_for<async_send_to_t>::prepare(::io_uring_sqe* sqe) noexcept -> void {
             ::io_uring_prep_sendmsg(sqe, fd, &msg, MSG_NOSIGNAL);
         }
         template<> auto uring_state_base_for<async_accept_t>::prepare(::io_uring_sqe* sqe) noexcept -> void {
             ::io_uring_prep_accept(sqe, fd, nullptr, nullptr, 0);
+        }
+        template<> auto uring_state_base_for<async_accept_t>::on_completion(int cqe_res, unsigned) -> bool {
+            if (cqe_res < 0) {
+                const std::error_code ec{-cqe_res, std::system_category()};
+                if (ec == std::errc::operation_canceled) result.set_stopped();
+                else result.set_error(ec);
+            }
+            // Wrap the freshly-minted fd into an opaque handle right at the mint site (the backend boundary),
+            // so the accept sender advertises native_handle and no raw fd escapes upward.
+            else result.set_value(to_handle(cqe_res));
+            return true;
         }
         template<> auto uring_state_base_for<async_connect_t>::prepare(::io_uring_sqe* sqe) noexcept -> void {
             auto [psa, len] = to_sockaddr(peer);
@@ -265,10 +277,11 @@ namespace coio {
         template<> auto uring_state_base_for<async_sleep_t>::prepare(::io_uring_sqe* sqe) noexcept -> void {
             ::io_uring_prep_timeout(sqe, &ts, 0, IORING_TIMEOUT_ABS);
         }
-        template<> auto uring_state_base_for<async_sleep_t>::complete(int cqe_res) -> void {
+        template<> auto uring_state_base_for<async_sleep_t>::on_completion(int cqe_res, unsigned) -> bool {
             if (cqe_res == -ETIME or cqe_res == 0) result.set_value();
             else if (cqe_res == -ECANCELED) result.set_stopped();
             else result.set_error(std::error_code{-cqe_res, std::system_category()});
+            return true;
         }
     }
 }

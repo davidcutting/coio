@@ -12,8 +12,6 @@
 #include <coio/detail/suppress_push.h> // IWYU pragma: keep
 
 namespace coio {
-    struct timer_cap {};
-
     template<typename Executor>
     class timer_scheduler;
 
@@ -22,7 +20,7 @@ namespace coio {
     // placement continuations run via the executor; schedule_after() posts a timer op here.
     class timer_driver {
     public:
-        using capability = timer_cap;
+        using capabilities = type_list<capability::timer>;
         template<typename Executor>
         using scheduler_of = timer_scheduler<Executor>;
 
@@ -80,7 +78,7 @@ namespace coio {
                     : context_(ctx), rcvr_(std::move(rcvr)) { this->deadline = when; }
 
                 COIO_ALWAYS_INLINE auto do_start() noexcept -> bool {
-                    context_.template get_driver<timer_cap>().submit(*this);
+                    context_.template get_driver<capability::timer>().submit(*this);
                     return true;
                 }
                 COIO_ALWAYS_INLINE auto do_finish(bool canceled) noexcept -> void {
@@ -88,7 +86,7 @@ namespace coio {
                     else execution::set_value(std::move(rcvr_));
                 }
                 auto do_cancel() -> void {
-                    if (context_.template get_driver<timer_cap>().remove(*this)) context_.submit(*this);
+                    if (context_.template get_driver<capability::timer>().remove(*this)) context_.submit(*this);
                 }
 
                 Executor& context_; // NOLINT(*-avoid-const-or-ref-data-members)

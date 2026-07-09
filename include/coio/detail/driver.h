@@ -3,6 +3,16 @@
 #include <cstddef>
 #include <coio/detail/operation_base.h>
 #include <coio/detail/intrusive_list.h>
+#include <coio/utils/type_traits.h>
+
+// Capability tags name SERVICES a driver can offer, not drivers themselves: several drivers may
+// provide the same capability (the timer heap, epoll's timerfd and io_uring's timeout op all
+// provide `timer`). A driver advertises its set via `using capabilities = type_list<...>`;
+// executor::get_driver<Cap> resolves to the FIRST driver (in declaration order) providing Cap.
+namespace coio::capability {
+    struct timer {}; // timed scheduling: schedule_at / schedule_after
+    struct io {};    // the io-op descriptor family (read/write/accept/...)
+}
 
 namespace coio::detail {
     // The executor's owner-only run queue. Drivers drain their ready completions into it; the executor
@@ -14,7 +24,7 @@ namespace coio::detail {
     // per driver (driver.submit(Driver::operation&)), so it is deliberately NOT part of this contract.
     template<typename D>
     concept driver = requires(D& d, ready_queue& ready, std::size_t batch) {
-        typename D::capability;
+        typename D::capabilities;
         d.poll(ready, batch);
     };
 

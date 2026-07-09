@@ -174,7 +174,7 @@ namespace coio {
         static constexpr std::size_t find = npos;
 
         template<typename T>
-        static constexpr bool containes = false;
+        static constexpr bool contains = false;
 
         template<typename... TypeLists>
         using concat = typename detail::type_list_concat_helper<type_list, TypeLists...>::type;

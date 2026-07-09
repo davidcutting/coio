@@ -48,7 +48,9 @@ namespace coio::detail {
     };
 
     struct async_accept_t {
-        using value_signature = execution::set_value_t(socket_native_handle_type);
+        // Yields the freshly-minted connection as an opaque handle; the backend wraps the raw fd at the
+        // CQE boundary (uring_state_base_for<async_accept_t>::complete), so nothing above sees a raw fd.
+        using value_signature = execution::set_value_t(native_handle);
     };
 
     struct async_connect_t {

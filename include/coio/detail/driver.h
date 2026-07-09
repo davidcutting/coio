@@ -11,7 +11,8 @@
 // executor::get_driver<Cap> resolves to the FIRST driver (in declaration order) providing Cap.
 namespace coio::capability {
     struct timer {}; // timed scheduling: schedule_at / schedule_after
-    struct io {};    // the io-op descriptor family (read/write/accept/...)
+    struct io {};    // sockets/pipes: the pollable io-op family (read/write/recv/send/accept/...)
+    struct file {};  // REGULAR files: not pollable, so epoll can't serve them — io_uring/IOCP only
 }
 
 namespace coio::detail {

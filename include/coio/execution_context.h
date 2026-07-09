@@ -250,6 +250,17 @@ namespace coio {
         explicit executor(std::in_place_t, Args&&... args)
             : drivers_(std::forward<Args>(args)...) {}
 
+        // Build EACH driver in place from its coio::driver_init spec — the multi-driver construction path.
+        // One spec per driver, in declaration order (wait-driver first). Non-movable drivers are emplaced
+        // via driver_spec's prvalue conversion (guaranteed elision), so this works for any driver count.
+        // Constrained on tuple-constructibility rather than naming driver_spec, so this header stays free
+        // of the builder machinery (which lives in init.h and includes THIS header) — no include cycle.
+        // Only a driver_spec converts to a non-movable driver, so this accepts exactly the intended args.
+        template<typename... Specs>
+            requires (sizeof...(Specs) == 1 + sizeof...(Rest))
+                and std::constructible_from<std::tuple<WaitDrv, Rest...>, Specs...>
+        explicit executor(Specs... specs) : drivers_(std::move(specs)...) {}
+
         executor(const executor&) = delete;
         auto operator= (const executor&) -> executor& = delete;
 
@@ -295,6 +306,12 @@ namespace coio {
         }
 
         [[nodiscard]] auto get_stop_token() const noexcept { return stop_source_.get_token(); }
+
+        // A cheap load signal for placement policies (e.g. the runtime's power-of-two-choices): the count
+        // of outstanding operations (work_started but not yet work_finished). Read cross-thread relaxed.
+        [[nodiscard]] COIO_ALWAYS_INLINE auto outstanding() const noexcept -> std::size_t {
+            return work_count_.load(std::memory_order_relaxed);
+        }
 
         // One non-blocking pass: claim ownership, drain posts, poll every driver, run up to `batch`
         // ready continuations. Returns whether it did any work. Never blocks.

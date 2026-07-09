@@ -70,9 +70,10 @@ namespace coio {
     // minus the run loop, which now lives in executor.
     class iocp_driver {
     public:
-        // io via overlapped syscalls + the port; timer via the shared deadline heap (timer_scheduler
-        // mixin) — iocp has no native timer op, so the heap's earliest deadline bounds the port wait.
-        using capabilities = type_list<capability::io, capability::timer>;
+        // io + regular files via overlapped syscalls + the port; timer via the shared deadline heap
+        // (timer_scheduler mixin) — iocp has no native timer op, so the heap's earliest deadline bounds
+        // the port wait.
+        using capabilities = type_list<capability::io, capability::file, capability::timer>;
         // The scheduler fragment this driver contributes (see detail::compose_scheduler): io_handle +
         // schedule_io, layered onto the shared timer mixin (which resolves get_driver<capability::timer>
         // back to this driver's heap).

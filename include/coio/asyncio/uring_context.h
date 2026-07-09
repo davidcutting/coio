@@ -45,8 +45,8 @@ namespace coio {
         friend class detail::uring_state_base_for;
 
     public:
-        // io via ring SQEs; timer via the native timeout op (async_sleep_t).
-        using capabilities = type_list<capability::io, capability::timer>;
+        // io via ring SQEs; regular files via the same ring (unlike epoll); timer via the native timeout op.
+        using capabilities = type_list<capability::io, capability::file, capability::timer>;
         // The scheduler fragment this driver contributes (see detail::compose_scheduler): io_handle +
         // schedule_io + multishot receive + TIMEOUT-backed timed scheduling, layered onto Base.
         template<typename Executor, typename Base>

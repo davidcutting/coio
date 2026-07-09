@@ -460,6 +460,11 @@ namespace coio {
     class stream_file : public detail::stream_file_base<IoScheduler> {
     private:
         using base = detail::stream_file_base<IoScheduler>;
+        // Regular files aren't pollable, so only a file-capable backend (io_uring/IOCP) can serve them.
+        // The gate is on the concrete FILE class, not stream_file_base, which pipes also derive from.
+        static_assert(IoScheduler::executor_type::template has_capability<capability::file>,
+            "regular file I/O needs a driver providing capability::file (io_uring/IOCP); "
+            "epoll can't do regular-file readiness");
 
     public:
         using enum detail::open_mode;
@@ -587,6 +592,9 @@ namespace coio {
     class random_access_file : public detail::random_access_file_base<IoScheduler> {
     private:
         using base = detail::random_access_file_base<IoScheduler>;
+        static_assert(IoScheduler::executor_type::template has_capability<capability::file>,
+            "regular file I/O needs a driver providing capability::file (io_uring/IOCP); "
+            "epoll can't do regular-file readiness");
 
     public:
         using enum detail::open_mode;

@@ -323,10 +323,17 @@ namespace coio {
                 // operation_base posts — still run, matching the old loop_base do_one ordering.)
                 if (work_count_.load(std::memory_order_relaxed) == 0) break;
 
-                // Arm elision, publish, re-check the inbox (Dekker), else block in the wait-owner.
+                // Arm elision, publish, re-check the inbox (Dekker), else block in the wait-owner. The
+                // re-check inspects ONLY the inbox — NOT a full run_once(). A run_once() here would poll the
+                // drivers, whose poll() resets the wait-driver's wake signal (epoll's interrupter eventfd /
+                // uring's msg_ring CQE). A cross-thread submit() that lands after we set parked_ pushes its
+                // op AND fires that wake; if the re-check's poll() consumed the wake without draining the
+                // inbox, we'd block in poll_wait() forever with the op stranded (the lost-wakeup that hung
+                // off-owner teardown). The inbox is the only thing a submit() can add after we park; driver
+                // completions are caught by poll_wait() itself, so an inbox-only load is the correct guard.
                 parked_.store(true, std::memory_order_relaxed);
                 std::atomic_thread_fence(std::memory_order_seq_cst);
-                if (run_once()) { parked_.store(false, std::memory_order_relaxed); ++turns; continue; }
+                if (not inject_stack_.empty()) { parked_.store(false, std::memory_order_relaxed); continue; }
                 wait_driver().poll_wait();
                 parked_.store(false, std::memory_order_relaxed);
             }

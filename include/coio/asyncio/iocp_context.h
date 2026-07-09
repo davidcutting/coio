@@ -1,4 +1,4 @@
-﻿// ReSharper disable CppPolymorphicClassWithNonVirtualPublicDestructor
+// ReSharper disable CppPolymorphicClassWithNonVirtualPublicDestructor
 // ReSharper disable CppRedundantTypenameKeyword
 #pragma once
 #include <coio/detail/config.h>
@@ -8,262 +8,134 @@
 
 #include <basetsd.h>
 #include <WinSock2.h>
+#include <bit>
+#include <chrono>
+#include <cstddef>
+#include <memory_resource>
+#include <mutex>
+#include <span>
+#include <utility>
 #include <coio/execution_context.h>
+#include <coio/time_loop.h>
 #include <coio/utils/async_result.h>
 #include <coio/detail/io_descriptions.h>
+#include <coio/detail/io_sender.h>
+#include <coio/detail/op_queue.h>
 #include <coio/detail/suppress_push.h> // IWYU pragma: keep
 
 namespace coio {
+    template<typename Executor, typename Base = timer_scheduler<Executor>>
+    class iocp_scheduler;
+
     namespace detail {
         template<typename Sexpr>
         class iocp_state_base_for;
 
         enum class seek_whence;
-    }
 
-    class iocp_context : public detail::loop_base<iocp_context> {
-        template<typename Sexpr>
-        friend class detail::iocp_state_base_for;
-        friend loop_base;
-
-    private:
-        static constexpr ::ULONG_PTR wake_completion_key = 1;
-
-        // ReSharper disable once CppPolymorphicClassWithNonVirtualPublicDestructor
-        struct iocp_node : ::OVERLAPPED, node {
-            explicit iocp_node(iocp_context& context, ::HANDLE handle) noexcept : ::OVERLAPPED{}, node(context), handle(handle) {}
+        // The completion-packet node: an OVERLAPPED the kernel writes through + a run-queue node. The
+        // driver reaps packets from the port, dispatches complete(), then posts the op to the ready queue.
+        // The OVERLAPPED must stay alive until its packet is reaped — guaranteed because the op-state
+        // lives until finish(), which runs strictly after the reap.
+        struct iocp_node : ::OVERLAPPED, operation_base {
+            explicit iocp_node(::HANDLE handle) noexcept : ::OVERLAPPED{}, handle(handle) {}
 
             virtual auto complete(::DWORD bytes_transferred, ::DWORD error) noexcept -> void = 0;
 
-            auto do_cancel() -> void;
+            // Ask the kernel to abort this op. Any thread — CancelIoEx is documented thread-safe, and a
+            // lost race with completion returns ERROR_NOT_FOUND, harmlessly. The aborted packet still
+            // arrives through the port (ERROR_OPERATION_ABORTED), so cancellation completes through the
+            // normal completion flow — the canceller never posts the op itself.
+            auto request_cancel() noexcept -> void;   // cpp: ::CancelIoEx(handle, this)
 
             ::HANDLE handle;
         };
 
+        // Blocking file helpers for io_handle (cpp: the Win32 syscalls stay out of the header templates).
+        // `offset` is the io_handle's tracked stream position (an OVERLAPPED handle has no usable file
+        // pointer, so stream_file position lives on the handle and read/write advance it).
+        auto iocp_initial_file_offset(::HANDLE handle) noexcept -> std::size_t;
+        auto iocp_file_resize(::HANDLE handle, std::size_t new_size, std::size_t restore_offset) -> void;
+        auto iocp_file_seek(::HANDLE handle, std::size_t offset, seek_whence whence, std::size_t current_offset) -> std::size_t;
+        auto iocp_file_read(::HANDLE handle, std::size_t& offset, std::span<std::byte> buffer) -> std::size_t;
+        auto iocp_file_write(::HANDLE handle, std::size_t& offset, std::span<const std::byte> buffer) -> std::size_t;
+    }
+
+    // The IOCP driver: a completion port. Unlike epoll (readiness) — and like uring — this is a
+    // completion model; but unlike uring there is no submission queue: each op issues its own overlapped
+    // syscall in do_start(), and the driver only reaps completion packets. Was iocp_context (loop_base)
+    // minus the run loop, which now lives in executor.
+    class iocp_driver {
     public:
-        class scheduler : public scheduler_base {
-            friend iocp_context;
-        public:
-            using scheduler_concept = detail::io_scheduler_tag;
+        // io via overlapped syscalls + the port; timer via the shared deadline heap (timer_scheduler
+        // mixin) — iocp has no native timer op, so the heap's earliest deadline bounds the port wait.
+        using capabilities = type_list<capability::io, capability::timer>;
+        // The scheduler fragment this driver contributes (see detail::compose_scheduler): io_handle +
+        // schedule_io, layered onto the shared timer mixin (which resolves get_driver<capability::timer>
+        // back to this driver's heap).
+        template<typename Executor, typename Base>
+        using scheduler_mixin = iocp_scheduler<Executor, timer_scheduler<Executor, Base>>;
 
-            class io_handle {
-                friend scheduler;
-            private:
-                struct handle_wrapper {
-                    ::HANDLE handle;
-
-                    // ReSharper disable once CppNonExplicitConversionOperator
-                    COIO_ALWAYS_INLINE operator ::HANDLE() const noexcept {
-                        return handle;
-                    }
-
-                    // ReSharper disable once CppNonExplicitConversionOperator
-                    COIO_ALWAYS_INLINE operator detail::socket_native_handle_type() const noexcept {
-                        return std::bit_cast<detail::socket_native_handle_type>(handle);
-                    }
-                };
-
-            public:
-                io_handle(iocp_context& ctx, ::HANDLE handle);
-
-                io_handle(const io_handle&) = delete;
-
-                io_handle(io_handle&& other) noexcept :
-                    ctx_(other.ctx_),
-                    handle_(std::exchange(other.handle_, INVALID_HANDLE_VALUE)),
-                    offset_(std::exchange(other.offset_, 0))
-                {}
-
-                ~io_handle();
-
-                auto operator= (io_handle other) noexcept -> io_handle& {
-                    swap(other);
-                    return *this;
-                }
-
-                auto swap(io_handle& other) noexcept -> void {
-                    std::ranges::swap(ctx_, other.ctx_);
-                    std::ranges::swap(handle_, other.handle_);
-                    std::ranges::swap(offset_, other.offset_);
-                }
-
-                friend auto swap(io_handle& lhs, io_handle& rhs) noexcept -> void {
-                    lhs.swap(rhs);
-                }
-
-                [[nodiscard]]
-                COIO_ALWAYS_INLINE auto get_io_scheduler() const noexcept -> scheduler {
-                    COIO_ASSERT(ctx_ != nullptr);
-                    return scheduler{*ctx_};
-                }
-
-                [[nodiscard]]
-                COIO_ALWAYS_INLINE auto native_handle() const noexcept {
-                    return handle_wrapper{handle_};
-                }
-
-                auto release() -> handle_wrapper;
-
-                auto cancel() -> void;
-
-                auto file_resize(std::size_t new_size) -> void;
-
-                auto file_seek(std::size_t offset, detail::seek_whence whence) -> std::size_t;
-
-                auto file_read(std::span<std::byte> buffer) -> std::size_t;
-
-                auto file_write(std::span<const std::byte> buffer) -> std::size_t;
-
-            private:
-                iocp_context* ctx_;
-                ::HANDLE handle_ = INVALID_HANDLE_VALUE;
-                std::size_t offset_ = 0; // for `stream_file`
-            };
-
-            // Cancellation need is deduced from the description (detail::is_unstoppable): a datagram send
-            // declares `unstoppable = true`, so the op-state sets coio_unstoppable and schedule_io skips
-            // stop_when. See uring_scheduler::schedule_io.
-            template<std::move_constructible Sexpr>
-            struct io_sender {
-                using sender_concept = execution::sender_tag;
-                using completion_signatures = execution::completion_signatures<
-                    typename Sexpr::value_signature,
-                    execution::set_error_t(std::error_code),
-                    execution::set_stopped_t()
-                >;
-
-                template<typename Rcvr>
-                struct state_base : detail::iocp_state_base_for<Sexpr> {
-                    static constexpr bool coio_unstoppable = detail::is_unstoppable<Sexpr>;
-
-                    using base = detail::iocp_state_base_for<Sexpr>;
-
-                    template<typename... Args>
-                    state_base(Rcvr rcvr, Args&&... args) noexcept
-                        : base(std::forward<Args>(args)...), rcvr_(std::move(rcvr)) {}
-
-                    COIO_ALWAYS_INLINE auto do_finish(bool) noexcept -> void {
-                        this->result.forward_to(std::move(this->rcvr_));
-                    }
-
-                    Rcvr rcvr_;
-                };
-
-                template<typename Rcvr>
-                using state = operation_state<state_base<Rcvr>>;
-
-                template<execution::receiver Rcvr>
-                COIO_ALWAYS_INLINE auto connect(Rcvr rcvr) && noexcept {
-                    COIO_ASSERT(context != nullptr);
-                    return state<Rcvr>{
-                        std::move(rcvr),
-                        std::exchange(handle, INVALID_HANDLE_VALUE),
-                        *std::exchange(context, nullptr),
-                        std::move(sexpr)
-                    };
-                }
-
-                template<similar_to<io_sender>, typename...>
-                static consteval auto get_completion_signatures() noexcept -> completion_signatures {
-                    return {};
-                }
-
-                COIO_ALWAYS_INLINE auto get_env() const noexcept -> env {
-                    return env{*context};
-                }
-
-                ::HANDLE handle;
-                iocp_context* context;
-                Sexpr sexpr;
-            };
-
-        public:
-            using scheduler_base::scheduler_base;
-
-            [[nodiscard]]
-            COIO_ALWAYS_INLINE auto make_io_handle(::HANDLE handle) const -> io_handle {
-                return io_handle{*ctx_, handle};
-            }
-
-            [[nodiscard]]
-            COIO_ALWAYS_INLINE auto make_io_handle(detail::socket_native_handle_type sock) const -> io_handle {
-                return io_handle{*ctx_, std::bit_cast<::HANDLE>(sock)};
-            }
-
-            template<typename Sexpr>
-            COIO_ALWAYS_INLINE static auto transform_sexpr(io_handle& obj, Sexpr sexpr) noexcept {
-                if constexpr (not std::same_as<Sexpr, detail::async_read_some_t> and not std::same_as<Sexpr, detail::async_write_some_t>) {
-                    return std::move(sexpr);
-                }
-                else {
-                    using result_t = std::conditional_t<
-                        std::same_as<Sexpr, detail::async_read_some_t>,
-                        detail::async_read_some_at_t,
-                        detail::async_write_some_at_t
-                    >;
-                    return result_t{
-                        .offset = std::exchange(obj.offset_, obj.offset_ + sexpr.buffer.size()),
-                        .buffer = sexpr.buffer
-                    };
-                }
-            }
-
-            // An unstoppable description (detail::is_unstoppable — datagram send) skips the per-op shutdown
-            // stop-hook; see uring_scheduler::schedule_io. transform_sexpr is identity for sends, so the
-            // trait survives onto transformed_sexpr_t.
-            template<typename Sexpr>
-            [[nodiscard]]
-            COIO_ALWAYS_INLINE auto schedule_io(io_handle& obj, Sexpr sexpr) noexcept {
-                using transformed_sexpr_t = decltype(transform_sexpr(obj, std::move(sexpr)));
-                io_sender<transformed_sexpr_t> sender{
-                    obj.handle_,
-                    ctx_,
-                    transform_sexpr(obj, std::move(sexpr))
-                };
-                if constexpr (detail::is_unstoppable<transformed_sexpr_t>) return sender;
-                else return stop_when(std::move(sender), ctx_->stop_source_.get_token());
-            }
-
-            friend auto operator== (const scheduler& lhs, const scheduler& rhs) -> bool = default;
+        // What one in-flight op needs to target a registration: a non-owning borrow of the scheduler's
+        // io_handle, valid only while it lives. Ferried opaquely by the generic detail::io_sender.
+        struct io_ref {
+            ::HANDLE handle = INVALID_HANDLE_VALUE;
         };
 
-        template<typename T = void, typename Alloc = void>
-        using task = coio::task<T, Alloc, scheduler>;
+        // The ops this driver implements (= the iocp_state_base_for specializations below/.cpp), in one
+        // visible list; detail::schedule_io static_asserts against it. No async_sleep_t — timers ride
+        // the heap (see scheduler_mixin).
+        using supported_io_ops = type_list<
+            detail::async_read_some_t, detail::async_write_some_t,
+            detail::async_read_some_at_t, detail::async_write_some_at_t,
+            detail::async_stream_send_t, detail::async_datagram_send_t,
+            detail::async_receive_t, detail::async_receive_from_t, detail::async_send_to_t,
+            detail::async_accept_t, detail::async_connect_t>;
+        template<typename IoOp>
+        static constexpr bool supports = supported_io_ops::template contains<IoOp>;
 
-    public:
-        explicit iocp_context(std::pmr::memory_resource& memory_resource = *std::pmr::get_default_resource());
+        // The per-op state base the generic detail::io_sender derives from.
+        template<typename IoOp>
+        using io_state = detail::iocp_state_base_for<IoOp>;
 
-        iocp_context(const iocp_context&) = delete;
+        explicit iocp_driver(std::pmr::memory_resource& mr = *std::pmr::get_default_resource());
+        iocp_driver(const iocp_driver&) = delete;
+        ~iocp_driver();
+        auto operator= (const iocp_driver&) -> iocp_driver& = delete;
 
-        ~iocp_context();
+        // ---- executor-facing contract ----
+        auto poll(detail::ready_queue& ready, std::size_t batch) -> void;
+        auto poll_wait() -> void;      // blocks on the port, bounded by the earliest timer deadline
+        auto wake_up() noexcept -> void;
 
-        auto operator= (const iocp_context&) -> iocp_context& = delete;
+        // ---- io_handle-facing (cpp: the Win32 syscalls stay out of the header templates) ----
+        auto register_handle(::HANDLE handle) -> void;                // associate with the port (throws)
+        static auto deregister_handle(::HANDLE handle) -> void;       // detach from the port (throws)
+        static auto cancel_handle(::HANDLE handle) noexcept -> void;  // CancelIoEx(handle, nullptr): abort every op on it
+
+        // ---- timer capability (driven by the shared timer_scheduler mixin) ----
+        auto submit(timer_driver::operation& op) -> void;   // any thread; wakes the port on a new earliest deadline
+        auto remove(timer_driver::operation& op) -> bool;
 
     private:
-        auto do_one(bool infinite) -> bool;
+        static constexpr ::ULONG_PTR wake_completion_key = 1;
 
-        auto interrupt() -> void;
+        struct packet {
+            ::OVERLAPPED* overlapped = nullptr;   // null = wake packet (nothing to dispatch)
+            ::DWORD bytes = 0;
+            ::DWORD error = 0;
+        };
+        // One GetQueuedCompletionStatus. False = nothing dequeued (timeout / empty port); true with a
+        // null overlapped = a bare wake packet (its only job was to end a wait).
+        auto reap(packet& out, ::DWORD timeout_ms) noexcept -> bool;
 
-        COIO_ALWAYS_INLINE auto consume(bool infinite) -> bool {
-            detail::operation_base* op = infinite ? op_queue_.dequeue() : op_queue_.try_dequeue();
-            if (op) op->finish();
-            return op;
-        }
-
-        COIO_ALWAYS_INLINE auto post_remote(detail::operation_base& n) -> void {
-            op_queue_.enqueue(n);
-            notify();
-        }
-
-        COIO_ALWAYS_INLINE auto shutdown() -> void {
-            interrupt();
-            op_queue_.request_stop();
-        }
-
-    private:
         ::HANDLE iocp_;
-        op_queue op_queue_;
-        atomutex bolt_;
+        packet stash_{};        // owner-only: a real packet poll_wait dequeued; the next poll() consumes
+        bool has_stash_ = false; // it first (the wait must not swallow completions — GQCS cannot peek).
+        std::mutex timer_mtx_;
+        detail::timer_queue<
+            timer_driver::operation, &timer_driver::operation::deadline, &timer_driver::operation::heap_index,
+            std::pmr::polymorphic_allocator<>> timers_;
     };
 
     namespace detail {
@@ -295,13 +167,15 @@ namespace coio {
         template<typename Sexpr>
         class iocp_state_base_for :
             private iocp_sexpr_wrapper<Sexpr>::type,
-            public iocp_context::iocp_node {
+            public iocp_node {
         private:
             using native_type = typename iocp_sexpr_wrapper<Sexpr>::type;
 
         public:
-            iocp_state_base_for(::HANDLE handle_, iocp_context& ctx, Sexpr sexpr) noexcept
-                : native_type(std::move(sexpr)), iocp_node(ctx, handle_) {}
+            // The driver reference is part of the generic io_state contract but unused here: iocp ops
+            // issue their own overlapped syscalls; the driver only reaps.
+            iocp_state_base_for(iocp_driver& /*driver*/, iocp_driver::io_ref ref, Sexpr sexpr) noexcept
+                : native_type(std::move(sexpr)), iocp_node(ref.handle) {}
 
         protected:
             auto do_start() noexcept -> bool {
@@ -312,6 +186,15 @@ namespace coio {
             auto complete(::DWORD, ::DWORD) noexcept -> void final {
                 static_assert(always_false<Sexpr>, "this operation isn't supported");
             }
+
+            // Generic io_sender hooks. try_cancel: fire CancelIoEx and let the aborted packet complete
+            // through the port — never post from here (see iocp_node::request_cancel). on_finish: iocp
+            // needs no pre-delivery bookkeeping.
+            auto try_cancel() noexcept -> bool {
+                this->request_cancel();
+                return false;
+            }
+            static auto on_finish() noexcept -> void {}
 
         protected:
             async_result<typename Sexpr::value_signature, execution::set_error_t(std::error_code)> result;
@@ -393,6 +276,140 @@ namespace coio {
         template<>
         auto iocp_state_base_for<async_connect_t>::complete(::DWORD, ::DWORD) noexcept -> void;
     }
+
+    // A scheduler mixin (not a standalone scheduler): adds iocp's io senders on top of Base — which, via
+    // iocp_driver::scheduler_mixin, is the shared timer mixin, so timed scheduling is inherited rather
+    // than reimplemented. The default Base keeps the plain `iocp_scheduler<Ex>` spelling equal to
+    // iocp_context's composed scheduler type.
+    template<typename Executor, typename Base>
+    class iocp_scheduler : public Base {
+    public:
+        using scheduler_concept = detail::io_scheduler_tag;
+        // The opaque handle this backend hands out: bits <-> the raw HANDLE/SOCKET (identity codec).
+        using native_handle_type = detail::native_handle;
+        using Base::Base;
+
+        // Internal, facaded by socket/file (held as their impl_). Registers the handle with the port on
+        // construction. Precondition: the owning facade — and hence this io_handle — outlives every
+        // operation issued on it (a suspended op's awaiting coroutine already holds the facade by
+        // reference). Teardown cancel() is fire-and-forget (CancelIoEx): aborted packets complete through
+        // the port, and each op-state owns its OVERLAPPED — there is no shared per-handle state to
+        // reclaim (contrast epoll's per_fd_data), so teardown is legal from any thread.
+        class io_handle {
+            friend iocp_scheduler;
+        public:
+            io_handle(Executor& ctx, ::HANDLE handle) : ctx_(&ctx), handle_(handle) {
+                // NOTE: `handle` must be opened with FILE_FLAG_OVERLAPPED / WSA_FLAG_OVERLAPPED.
+                if (handle_ != INVALID_HANDLE_VALUE and handle_ != nullptr) {
+                    offset_ = detail::iocp_initial_file_offset(handle_);
+                    ctx.template get_driver<capability::io>().register_handle(handle_);
+                }
+            }
+
+            io_handle(const io_handle&) = delete;
+
+            io_handle(io_handle&& other) noexcept :
+                ctx_(other.ctx_),
+                handle_(std::exchange(other.handle_, INVALID_HANDLE_VALUE)),
+                offset_(std::exchange(other.offset_, 0)) {}
+
+            ~io_handle() { cancel(); }
+
+            auto operator= (io_handle other) noexcept -> io_handle& {
+                swap(other);
+                return *this;
+            }
+
+            auto swap(io_handle& other) noexcept -> void {
+                std::ranges::swap(ctx_, other.ctx_);
+                std::ranges::swap(handle_, other.handle_);
+                std::ranges::swap(offset_, other.offset_);
+            }
+
+            friend auto swap(io_handle& lhs, io_handle& rhs) noexcept -> void { lhs.swap(rhs); }
+
+            [[nodiscard]] auto get_io_scheduler() const noexcept -> iocp_scheduler {
+                COIO_ASSERT(ctx_ != nullptr);
+                return iocp_scheduler{*ctx_};
+            }
+
+            // Public accessors speak the opaque handle; the raw HANDLE stays a backend-internal detail.
+            [[nodiscard]] auto native_handle() const noexcept -> detail::native_handle {
+                return detail::to_handle(std::bit_cast<detail::native_fd>(handle_));
+            }
+
+            auto release() -> detail::native_handle {
+                if (handle_ != INVALID_HANDLE_VALUE) {
+                    cancel();
+                    iocp_driver::deregister_handle(handle_);
+                }
+                offset_ = 0;
+                return detail::to_handle(std::bit_cast<detail::native_fd>(std::exchange(handle_, INVALID_HANDLE_VALUE)));
+            }
+
+            auto cancel() -> void {
+                if (handle_ == INVALID_HANDLE_VALUE) return;
+                iocp_driver::cancel_handle(handle_);
+            }
+
+            // Blocking file ops against the tracked offset (see detail::iocp_file_*).
+            auto file_resize(std::size_t new_size) -> void {
+                detail::iocp_file_resize(handle_, new_size, offset_);
+            }
+            auto file_seek(std::size_t offset, detail::seek_whence whence) -> std::size_t {
+                return offset_ = detail::iocp_file_seek(handle_, offset, whence, offset_);
+            }
+            auto file_read(std::span<std::byte> buffer) -> std::size_t {
+                return detail::iocp_file_read(handle_, offset_, buffer);
+            }
+            auto file_write(std::span<const std::byte> buffer) -> std::size_t {
+                return detail::iocp_file_write(handle_, offset_, buffer);
+            }
+
+        private:
+            // The op-facing borrow of this registration (see iocp_driver::io_ref).
+            [[nodiscard]] auto ref() const noexcept -> iocp_driver::io_ref { return {handle_}; }
+
+            Executor* ctx_;
+            ::HANDLE handle_ = INVALID_HANDLE_VALUE;
+            std::size_t offset_ = 0; // for stream_file (see transform_sexpr)
+        };
+
+        [[nodiscard]] auto make_io_handle(detail::native_handle handle) const -> io_handle {
+            return io_handle{*this->ctx_, std::bit_cast<::HANDLE>(detail::to_native(handle))}; // decode at the boundary
+        }
+
+        // An OVERLAPPED handle has no usable moving file pointer: plain read_some/write_some become
+        // positioned ops at the io_handle's tracked offset, which then advances. Identity for all else.
+        template<typename Sexpr>
+        COIO_ALWAYS_INLINE static auto transform_sexpr(io_handle& obj, Sexpr sexpr) noexcept {
+            if constexpr (not std::same_as<Sexpr, detail::async_read_some_t> and not std::same_as<Sexpr, detail::async_write_some_t>) {
+                return std::move(sexpr);
+            }
+            else {
+                using result_t = std::conditional_t<
+                    std::same_as<Sexpr, detail::async_read_some_t>,
+                    detail::async_read_some_at_t,
+                    detail::async_write_some_at_t
+                >;
+                return result_t{
+                    .offset = std::exchange(obj.offset_, obj.offset_ + sexpr.buffer.size()),
+                    .buffer = sexpr.buffer
+                };
+            }
+        }
+
+        // One generic sender serves every io op (detail::io_sender); this driver contributes io_ref +
+        // io_state<IoOp>. Unstoppable descriptions (datagram send) skip the stop_when wrap there;
+        // transform_sexpr is identity for sends, so the trait survives onto the transformed type.
+        template<typename Sexpr>
+        [[nodiscard]] auto schedule_io(io_handle& obj, Sexpr sexpr) const noexcept {
+            return detail::schedule_io(*this->ctx_, obj.ref(), transform_sexpr(obj, std::move(sexpr)));
+        }
+    };
+
+    // The public io context type: a single-owner executor whose one driver is the completion port.
+    using iocp_context = executor<iocp_driver>;
 }
 
 #include <coio/detail/suppress_pop.h> // IWYU pragma: keep

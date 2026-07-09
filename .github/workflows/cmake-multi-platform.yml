@@ -113,6 +113,13 @@ jobs:
         shell: bash
         run: echo "build-output-dir=${{ github.workspace }}/build" >> "$GITHUB_OUTPUT"
 
+      # The io_uring backend needs liburing headers to compile (uring_context.h #errors without them).
+      # ubuntu-latest is 24.04 (liburing 2.5). If a newer symbol (io_uring_register_sync_msg, ~2.6) is
+      # missing, that surfaces here as an undeclared-identifier in wake_up().
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev
+
       - name: Configure CMake
         run: >
           cmake 
@@ -132,4 +139,6 @@ jobs:
 
       - name: Test
         working-directory: ${{ steps.strings.outputs.build-output-dir }}
-        run: ctest --output-on-failure --build-config ${{ matrix.build_type }}
+        # --timeout so a hung test (see the teardown/park race) fails fast instead of stalling the job for
+        # hours. 120s is generous for the slow sanitizer builds; normal runs finish in well under a second.
+        run: ctest --output-on-failure --build-config ${{ matrix.build_type }} --timeout 120

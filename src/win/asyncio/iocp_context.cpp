@@ -5,6 +5,7 @@
 #include <WS2tcpip.h>
 #include <MSWSock.h>
 #include <Windows.h>
+#include <algorithm>
 #include <limits>
 #include <coio/asyncio/iocp_context.h>
 #include <coio/asyncio/file.h>
@@ -71,93 +72,69 @@ namespace coio {
                 }
             }
         }
-    }
 
-    auto iocp_context::iocp_node::do_cancel() -> void {
-        ::CancelIoEx(handle, this);
-    }
+        auto iocp_node::request_cancel() noexcept -> void {
+            ::CancelIoEx(handle, this);
+        }
 
-    iocp_context::scheduler::io_handle::io_handle(iocp_context& ctx, ::HANDLE handle)
-        : ctx_(&ctx), handle_(handle) {
-        // NOTE: `handle` must be opend with `FILE_FLAG_OVERLAPPED` or `WSA_FLAG_OVERLAPPED`
-        if (handle != INVALID_HANDLE_VALUE and handle != nullptr) {
+        auto iocp_initial_file_offset(::HANDLE handle) noexcept -> std::size_t {
+            // Fails harmlessly (returns 0) for non-seekable handles (sockets, pipes).
             if (::LARGE_INTEGER current{}; ::SetFilePointerEx(handle, {}, &current, FILE_CURRENT)) {
-                offset_ = static_cast<std::size_t>(current.QuadPart);
+                return static_cast<std::size_t>(current.QuadPart);
             }
-            if (::CreateIoCompletionPort(handle, ctx.iocp_, 0, 0) == nullptr) {
-                throw std::system_error{detail::to_error_code(::GetLastError()), "iocp_context::make_io_handle"};
+            return 0;
+        }
+
+        auto iocp_file_resize(::HANDLE handle, std::size_t new_size, std::size_t restore_offset) -> void {
+            throw_win_error(::SetFilePointerEx(handle, {.QuadPart = ::LONGLONG(new_size)}, nullptr, FILE_BEGIN), "resize");
+            throw_win_error(::SetEndOfFile(handle), "resize");
+            throw_win_error(::SetFilePointerEx(handle, {.QuadPart = ::LONGLONG(restore_offset)}, nullptr, FILE_BEGIN), "resize");
+        }
+
+        auto iocp_file_seek(::HANDLE handle, std::size_t offset, seek_whence whence, std::size_t current_offset) -> std::size_t {
+            if (handle == INVALID_HANDLE_VALUE) {
+                throw std::system_error{std::make_error_code(std::errc::bad_file_descriptor), "seek"};
             }
+            if (offset > static_cast<std::size_t>(std::numeric_limits<::LONGLONG>::max())) {
+                throw std::system_error{std::make_error_code(std::errc::value_too_large), "seek"};
+            }
+
+            ::DWORD method;
+            switch (whence)
+            {
+            case seek_whence::seek_set:
+                method = FILE_BEGIN;
+                break;
+            case seek_whence::seek_cur:
+                method = FILE_BEGIN;
+                offset = current_offset + offset;
+                break;
+            case seek_whence::seek_end:
+                method = FILE_END;
+                break;
+            default: unreachable();
+            }
+
+            ::LARGE_INTEGER new_offset{};
+            throw_win_error(::SetFilePointerEx(handle, {.QuadPart = ::LONGLONG(offset)}, &new_offset, method), "seek");
+            return static_cast<std::size_t>(new_offset.QuadPart);
+        }
+
+        auto iocp_file_read(::HANDLE handle, std::size_t& offset, std::span<std::byte> buffer) -> std::size_t {
+            const auto n = file_read_at(handle, offset, buffer);
+            offset += n;
+            return n;
+        }
+
+        auto iocp_file_write(::HANDLE handle, std::size_t& offset, std::span<const std::byte> buffer) -> std::size_t {
+            const auto n = file_write_at(handle, offset, buffer);
+            offset += n;
+            return n;
         }
     }
 
-    iocp_context::scheduler::io_handle::~io_handle() {
-        cancel();
-    }
-
-    auto iocp_context::scheduler::io_handle::release() -> handle_wrapper {
-        if (handle_ != INVALID_HANDLE_VALUE) {
-            cancel();
-            detail::deassociate_iocp(handle_);
-        }
-        offset_ = 0;
-        return handle_wrapper{std::exchange(handle_, INVALID_HANDLE_VALUE)};
-    }
-
-    auto iocp_context::scheduler::io_handle::cancel() -> void {
-        if (handle_ == INVALID_HANDLE_VALUE) return;
-        ::CancelIoEx(handle_, nullptr);
-    }
-
-    auto iocp_context::scheduler::io_handle::file_resize(std::size_t new_size) -> void {
-        detail::throw_win_error(::SetFilePointerEx(handle_, {.QuadPart = ::LONGLONG(new_size)}, nullptr, FILE_BEGIN), "resize");
-        detail::throw_win_error(::SetEndOfFile(handle_), "resize");
-        detail::throw_win_error(::SetFilePointerEx(handle_, {.QuadPart = ::LONGLONG(offset_)}, nullptr, FILE_BEGIN), "resize");
-    }
-
-    auto iocp_context::scheduler::io_handle::file_seek(std::size_t offset, detail::seek_whence whence) -> std::size_t {
-        if (handle_ == INVALID_HANDLE_VALUE) {
-            throw std::system_error{std::make_error_code(std::errc::bad_file_descriptor), "seek"};
-        }
-        if (offset > static_cast<std::size_t>(std::numeric_limits<::LONGLONG>::max())) {
-            throw std::system_error{std::make_error_code(std::errc::value_too_large), "seek"};
-        }
-
-        ::DWORD method;
-        switch (whence)
-        {
-        case detail::seek_whence::seek_set:
-            method = FILE_BEGIN;
-            break;
-        case detail::seek_whence::seek_cur:
-            method = FILE_BEGIN;
-            offset = offset_ + offset;
-            break;
-        case detail::seek_whence::seek_end:
-            method = FILE_END;
-            break;
-        default: unreachable();
-        }
-
-        ::LARGE_INTEGER new_offset{};
-        detail::throw_win_error(::SetFilePointerEx(handle_, {.QuadPart = ::LONGLONG(offset)}, &new_offset, method), "seek");
-        return offset_ = static_cast<std::size_t>(new_offset.QuadPart);
-    }
-
-    auto iocp_context::scheduler::io_handle::file_read(std::span<std::byte> buffer) -> std::size_t {
-        const auto n = detail::file_read_at(handle_, offset_, buffer);
-        offset_ += n;
-        return n;
-    }
-
-    auto iocp_context::scheduler::io_handle::file_write(std::span<const std::byte> buffer) -> std::size_t {
-        const auto n = detail::file_write_at(handle_, offset_, buffer);
-        offset_ += n;
-        return n;
-    }
-
-
-    iocp_context::iocp_context(std::pmr::memory_resource& memory_resource)
-        : loop_base(memory_resource) {
+    iocp_driver::iocp_driver(std::pmr::memory_resource& mr)
+        : timers_(std::pmr::polymorphic_allocator<>{&mr}) {
         detail::wsa_init_library();
         iocp_ = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
         if (iocp_ == nullptr) {
@@ -165,69 +142,96 @@ namespace coio {
         }
     }
 
-    iocp_context::~iocp_context() {
-        request_stop();
+    iocp_driver::~iocp_driver() {
         ::CloseHandle(iocp_);
     }
 
-    auto iocp_context::do_one(bool infinite) -> bool {
-        if (work_count_ == 0) return false;
-
-        while (work_count_ > 0) {
-            if (const auto op = op_queue_.try_dequeue()) {
-                op->finish();
-                return true;
-            }
-
-            std::unique_lock lock{bolt_, std::try_to_lock};
-            if (not lock) {
-                return consume(infinite);
-            }
-
-            if (work_count_ == 0) break;
-
-            long long timeout = infinite ? INFINITE : 0;
-            if (infinite) {
-                if (const auto earliest = timer_queue_.earliest()) {
-                    const auto duration = *earliest - std::chrono::steady_clock::now();
-                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-                    timeout = std::clamp(ms, 0ll, 0xff'ff'ff'ffll);
-                }
-            }
-
-            ::OVERLAPPED* overlapped = nullptr;
-            ::ULONG_PTR key = 0;
-            ::DWORD bytes = 0;
-            const ::BOOL success = ::GetQueuedCompletionStatus(iocp_, &bytes, &key, &overlapped, static_cast<::DWORD>(timeout));
-            const ::DWORD err = success ? 0 : ::GetLastError();
-
-            detail::intrusive_list<detail::operation_base> ready_time_ops{&detail::operation_base::next_},
-                ready_io_ops{&detail::operation_base::next_};
-            timer_queue_.take_ready_timers(ready_time_ops);
-
-            lock.unlock();
-
-            if (overlapped and key != wake_completion_key) {
-                auto op = static_cast<iocp_node*>(overlapped);
-                op->complete(bytes, err);
-                ready_io_ops.push_back(*op);
-            }
-
-            if (auto ops = ready_time_ops.release()) op_queue_.enqueue(*ops);
-            if (auto ops = ready_io_ops.release()) op_queue_.enqueue(*ops);
-
-            if (not infinite) {
-                const auto op = op_queue_.try_dequeue();
-                if (op) op->finish();
-                return op != nullptr;
-            }
+    auto iocp_driver::reap(packet& out, ::DWORD timeout_ms) noexcept -> bool {
+        ::OVERLAPPED* overlapped = nullptr;
+        ::ULONG_PTR key = 0;
+        ::DWORD bytes = 0;
+        const ::BOOL success = ::GetQueuedCompletionStatus(iocp_, &bytes, &key, &overlapped, timeout_ms);
+        if (overlapped == nullptr) {
+            // Success -> a bare wake packet (PostQueuedCompletionStatus with a null OVERLAPPED);
+            // failure -> timeout / nothing dequeued.
+            return success != 0;
         }
-
-        return false;
+        out.overlapped = key == wake_completion_key ? nullptr : overlapped;
+        out.bytes = bytes;
+        // For a dequeued packet, failure means the op itself failed; GetLastError is its error.
+        out.error = success ? 0 : ::GetLastError();
+        return true;
     }
 
-    auto iocp_context::interrupt() -> void {
+    auto iocp_driver::poll(detail::ready_queue& ready, std::size_t batch) -> void {
+        {
+            std::scoped_lock _{timer_mtx_};
+            timers_.take_ready_timers(ready);
+        }
+        for (std::size_t i = 0; i < batch; ++i) {
+            packet p{};
+            if (has_stash_) {
+                p = std::exchange(stash_, {});
+                has_stash_ = false;
+            }
+            else if (not reap(p, 0)) {
+                break;
+            }
+            if (p.overlapped == nullptr) continue; // wake packet: its only job was to end a wait
+            auto* op = static_cast<detail::iocp_node*>(p.overlapped);
+            op->complete(p.bytes, p.error);
+            ready.push_back(*op);
+        }
+    }
+
+    auto iocp_driver::poll_wait() -> void {
+        ::DWORD timeout = INFINITE;
+        {
+            std::scoped_lock _{timer_mtx_};
+            if (const auto earliest = timers_.earliest()) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    *earliest - std::chrono::steady_clock::now()).count();
+                timeout = static_cast<::DWORD>(std::clamp(ms, 0ll, 0xff'ff'ff'fell)); // 0xffffffff == INFINITE
+            }
+        }
+        packet p{};
+        if (reap(p, timeout) and p.overlapped != nullptr) {
+            // A real completion ended the wait. GQCS cannot peek, so stash it for the next poll().
+            stash_ = p;
+            has_stash_ = true;
+        }
+    }
+
+    auto iocp_driver::wake_up() noexcept -> void {
         ::PostQueuedCompletionStatus(iocp_, 0, wake_completion_key, nullptr);
+    }
+
+    auto iocp_driver::register_handle(::HANDLE handle) -> void {
+        if (::CreateIoCompletionPort(handle, iocp_, 0, 0) == nullptr) {
+            throw std::system_error{detail::to_error_code(::GetLastError()), "iocp_driver::register_handle"};
+        }
+    }
+
+    auto iocp_driver::deregister_handle(::HANDLE handle) -> void {
+        detail::deassociate_iocp(handle);
+    }
+
+    auto iocp_driver::cancel_handle(::HANDLE handle) noexcept -> void {
+        ::CancelIoEx(handle, nullptr);
+    }
+
+    auto iocp_driver::submit(timer_driver::operation& op) -> void {
+        bool became_earliest = false;
+        {
+            std::scoped_lock _{timer_mtx_};
+            became_earliest = timers_.add(op);
+        }
+        if (became_earliest) wake_up(); // re-evaluate the wait deadline in poll_wait
+    }
+
+    auto iocp_driver::remove(timer_driver::operation& op) -> bool {
+        std::scoped_lock _{timer_mtx_};
+        return timers_.remove(op);
     }
 
 
@@ -245,6 +249,11 @@ namespace coio {
             }
         }
 
+        // NOTE on the do_start() convention (generic detail::operation_state): true = async completion
+        // pending (or already fed to the port); false = completed synchronously with `result` set — the
+        // op-state posts itself to the run queue. IOCP queues a packet even for synchronously-successful
+        // overlapped calls, so those return true and wait for the packet; only pre-syscall failures and
+        // empty-buffer no-ops return false.
         // TODO: Support asynchronous operations for files which use `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` as notification mode
 
         /// async_read_some
@@ -256,8 +265,7 @@ namespace coio {
             }
             if (buffer.empty()) [[unlikely]] {
                 result.set_value(0);
-                immediately_post();
-                return true;
+                return false;
             }
 
             ::DWORD bytes_read = 0;
@@ -306,8 +314,7 @@ namespace coio {
             }
             if (buffer.empty()) [[unlikely]] {
                 result.set_value(0);
-                immediately_post();
-                return true;
+                return false;
             }
 
             ::DWORD bytes_written = 0;
@@ -347,8 +354,7 @@ namespace coio {
             }
             if (buffer.empty()) [[unlikely]] {
                 result.set_value(0);
-                immediately_post();
-                return true;
+                return false;
             }
 
             ::DWORD bytes_read = 0;
@@ -393,10 +399,9 @@ namespace coio {
             }
             if (buffer.empty()) [[unlikely]] {
                 result.set_value(0);
-                immediately_post();
-                return true;
+                return false;
             }
-            
+
             ::DWORD bytes_written = 0;
             Offset = static_cast<::DWORD>(offset & 0xff'ff'ff'ffu);
             OffsetHigh = static_cast<::DWORD>(offset >> 32u);
@@ -436,8 +441,7 @@ namespace coio {
             }
             if (buffer.empty()) [[unlikely]] {
                 result.set_value(0);
-                immediately_post();
-                return true;
+                return false;
             }
 
             ::WSABUF wsabuf = span_to_wsabuf(buffer);
@@ -487,8 +491,7 @@ namespace coio {
             }
             if (buffer.empty()) [[unlikely]] {
                 result.set_value(0);
-                immediately_post();
-                return true;
+                return false;
             }
 
             ::WSABUF wsabuf = span_to_wsabuf(buffer);
@@ -535,8 +538,7 @@ namespace coio {
             }
             if (buffer.empty()) [[unlikely]] {
                 result.set_value(0);
-                immediately_post();
-                return true;
+                return false;
             }
 
             ::WSABUF wsabuf = span_to_wsabuf(buffer);
@@ -582,7 +584,7 @@ namespace coio {
                 result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
                 return false;
             }
-            
+
             std::memset(&peer_storage, 0, sizeof(peer_storage));
             peer_length = sizeof(::sockaddr_storage);
             ::WSABUF wsabuf = span_to_wsabuf(buffer);
@@ -631,7 +633,7 @@ namespace coio {
                 result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
                 return false;
             }
-            
+
             ::WSABUF wsabuf = span_to_wsabuf(buffer);
             ::DWORD bytes_sent = 0;
             auto sa = endpoint_to_sockaddr_in(peer);
@@ -701,7 +703,7 @@ namespace coio {
                 result.set_error(to_error_code(static_cast<::DWORD>(::WSAGetLastError())));
                 return false;
             }
-            
+
             ::DWORD bytes_received = 0;
             const ::BOOL ok = ::AcceptEx(
                 sock,
@@ -737,7 +739,9 @@ namespace coio {
                 reinterpret_cast<const char*>(&handle),
                 sizeof(handle)
             );
-            result.set_value(accepted);
+            // Wrap the minted socket into the opaque handle at the completion boundary; nothing above
+            // the backend sees a raw SOCKET.
+            result.set_value(to_handle(accepted));
         }
 
         /// async_connect

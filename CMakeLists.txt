@@ -156,6 +156,26 @@ if (COIO_SANITIZERS)
     endif()
 endif()
 
+# mimalloc as the default allocator (measured 1.5-3.3x on spawn-heavy throughput vs glibc; neutral on
+# the allocation-free datagram path). Linked PUBLIC so it propagates into every executable that links
+# coio. --no-as-needed is required: coio references no mimalloc symbol directly (it calls malloc, which
+# resolves at runtime), so the linker would otherwise drop the DT_NEEDED and the override wouldn't
+# happen. Skipped under sanitizers, which install their own malloc interceptors.
+option(COIO_USE_MIMALLOC "Link mimalloc as the default allocator" ON)
+if (COIO_USE_MIMALLOC AND NOT COIO_SANITIZERS)
+    find_library(MIMALLOC_LIBRARY NAMES mimalloc)
+    if (MIMALLOC_LIBRARY)
+        message(STATUS "Using mimalloc as the default allocator: ${MIMALLOC_LIBRARY}")
+        target_link_libraries(
+            ${PROJECT_NAME}
+            PUBLIC
+            "-Wl,--no-as-needed" ${MIMALLOC_LIBRARY} "-Wl,--as-needed"
+        )
+    else()
+        message(WARNING "COIO_USE_MIMALLOC=ON but libmimalloc was not found; using the system allocator")
+    endif()
+endif()
+
 if (COIO_SENDERS_BACKEND STREQUAL "NVIDIA")
     target_compile_features(
         ${PROJECT_NAME}

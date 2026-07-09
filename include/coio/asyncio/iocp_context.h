@@ -120,7 +120,10 @@ namespace coio {
                 std::size_t offset_ = 0; // for `stream_file`
             };
 
-            template<std::move_constructible Sexpr>
+            // Stoppable=false marks the op as needing no cancellation (datagram send): the op-state
+            // declares coio_unstoppable so operation_state skips the stop-callback, and schedule_io skips
+            // stop_when. See uring_scheduler::schedule_io.
+            template<std::move_constructible Sexpr, bool Stoppable = true>
             struct io_sender {
                 using sender_concept = execution::sender_tag;
                 using completion_signatures = execution::completion_signatures<
@@ -131,6 +134,8 @@ namespace coio {
 
                 template<typename Rcvr>
                 struct state_base : detail::iocp_state_base_for<Sexpr> {
+                    static constexpr bool coio_unstoppable = not Stoppable;
+
                     using base = detail::iocp_state_base_for<Sexpr>;
 
                     template<typename... Args>
@@ -203,18 +208,19 @@ namespace coio {
                 }
             }
 
-            template<typename Sexpr>
+            // Stoppable=false skips the per-op shutdown stop-hook; see uring_scheduler::schedule_io.
+            // Valid only for ops that complete promptly regardless of the peer (datagram send).
+            template<bool Stoppable = true, typename Sexpr>
             [[nodiscard]]
             COIO_ALWAYS_INLINE auto schedule_io(io_object& obj, Sexpr sexpr) noexcept {
                 using transformed_sexpr_t = decltype(transform_sexpr(obj, std::move(sexpr)));
-                return stop_when(
-                    io_sender<transformed_sexpr_t>{
-                        obj.handle_,
-                        ctx_,
-                        transform_sexpr(obj, std::move(sexpr))
-                    },
-                    ctx_->stop_source_.get_token()
-                );
+                io_sender<transformed_sexpr_t, Stoppable> sender{
+                    obj.handle_,
+                    ctx_,
+                    transform_sexpr(obj, std::move(sexpr))
+                };
+                if constexpr (Stoppable) return stop_when(std::move(sender), ctx_->stop_source_.get_token());
+                else return sender;
             }
 
             friend auto operator== (const scheduler& lhs, const scheduler& rhs) -> bool = default;

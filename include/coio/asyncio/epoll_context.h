@@ -241,7 +241,9 @@ namespace coio {
             epoll_driver::per_fd_data* data_ = nullptr;
         };
 
-        template<typename Sexpr>
+        // Stoppable=false marks the op as needing no cancellation (datagram send): the op-state declares
+        // coio_unstoppable so operation_state skips the stop-callback, and schedule_io skips stop_when.
+        template<typename Sexpr, bool Stoppable = true>
         struct io_sender {
             using sender_concept = execution::sender_tag;
             using completion_signatures = execution::completion_signatures<
@@ -249,6 +251,8 @@ namespace coio {
 
             template<typename Rcvr>
             struct state_base : detail::epoll_state_base_for<Sexpr> {
+                static constexpr bool coio_unstoppable = not Stoppable;
+
                 state_base(Executor& ctx, int fd, epoll_driver::per_fd_data* data, Sexpr sexpr, Rcvr rcvr) noexcept
                     : detail::epoll_state_base_for<Sexpr>(fd, ctx.template get_driver<epoll_cap>(), data, std::move(sexpr)),
                       context_(ctx), rcvr_(std::move(rcvr)) {}
@@ -283,9 +287,13 @@ namespace coio {
 
         [[nodiscard]] auto make_io_object(int fd) const -> io_object { return io_object{*this->ctx_, fd}; }
 
-        template<typename Sexpr>
+        // Stoppable=false skips the per-op shutdown stop-hook; see uring_scheduler::schedule_io. Valid
+        // only for ops that complete promptly regardless of the peer (datagram send).
+        template<bool Stoppable = true, typename Sexpr>
         [[nodiscard]] auto schedule_io(io_object& obj, Sexpr sexpr) const noexcept {
-            return stop_when(io_sender<Sexpr>{obj.fd_, this->ctx_, obj.data_, std::move(sexpr)}, this->ctx_->get_stop_token());
+            io_sender<Sexpr, Stoppable> sender{obj.fd_, this->ctx_, obj.data_, std::move(sexpr)};
+            if constexpr (Stoppable) return stop_when(std::move(sender), this->ctx_->get_stop_token());
+            else return sender;
         }
 
         // A timer on epoll is a timerfd readiness op: it owns its timerfd + a private per_fd_data, arms the

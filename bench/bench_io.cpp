@@ -76,6 +76,38 @@ namespace {
     }
     BENCHMARK(multi_threaded_run)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseRealTime();
 
+    // Same total work as multi_threaded_run, but production is DISTRIBUTED: one producer coroutine is
+    // seeded per worker (round-robin, so one lands on each), and each spawns its 1/N share via the
+    // runtime's round-robin spawn. So there are N parallel in-worker producers cross-posting to the
+    // pool, instead of one external thread feeding N idle workers. This is the realistic fan-out shape
+    // (work begets work on-worker). If THIS scales where multi_threaded_run cliffs, the cliff is the
+    // single-external-producer wakeup storm, not the cross-worker submit path itself.
+    void multi_threaded_inworker_run(benchmark::State& state) {
+        const std::size_t workers = static_cast<std::size_t>(state.range(0));
+        constexpr long tasks = 200'000;
+        constexpr std::size_t entries = 256;
+        const long per = tasks / static_cast<long>(workers);
+        for (auto _ : state) {
+            state.PauseTiming();
+            std::optional<coio::uring_runtime> rt{std::in_place, workers, entries};
+            state.ResumeTiming();
+
+            for (std::size_t w = 0; w < workers; ++w) {
+                rt->spawn(coio::just() | coio::let_value([rt = &*rt, per] {
+                    for (long i = 0; i < per; ++i) rt->spawn(coio::just());
+                    return coio::just();
+                }));
+            }
+            coio::this_thread::sync_wait(rt->join());
+
+            state.PauseTiming();
+            rt.reset();
+            state.ResumeTiming();
+        }
+        state.SetItemsProcessed(state.iterations() * per * static_cast<long>(workers));
+    }
+    BENCHMARK(multi_threaded_inworker_run)->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseRealTime();
+
     // Frame-pool churn: a bounded pipeline of pinned coroutines. Each task does a little work then
     // spawns its replacement ON its worker, keeping ~k in flight, so completed frames recycle through
     // the worker's frame pool instead of being malloc'd fresh. buf[] makes the frame non-trivial.

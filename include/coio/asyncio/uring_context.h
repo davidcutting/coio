@@ -7,8 +7,12 @@
 #include <liburing.h>
 #include <netinet/in.h>
 #include <atomic>
+#include <bit>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <span>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -24,6 +28,10 @@ namespace coio {
 
     template<typename Executor>
     class uring_scheduler;
+
+    // Defined below uring_scheduler (its ctor needs the uring_context alias), but named in the scheduler's
+    // multishot methods by reference/pointer — a forward declaration is enough there.
+    class buffer_ring;
 
     namespace detail {
         template<typename Sexpr>
@@ -57,6 +65,11 @@ namespace coio {
             virtual auto prepare(::io_uring_sqe* sqe) noexcept -> void = 0;   // Sexpr-specialized (in the .cpp)
             virtual auto complete(int cqe_res) -> void = 0;
 
+            // Per-CQE hook the driver calls from classify(). Returns true when the op is FINISHED (drive it
+            // to the ready queue and free it), false when it stays armed for more CQEs (multishot). Default
+            // = single-shot: deliver once and finish. `flags` carries IORING_CQE_F_MORE/F_BUFFER + buffer id.
+            virtual auto on_completion(int cqe_res, unsigned /*cqe_flags*/) -> bool { complete(cqe_res); return true; }
+
             uring_driver& driver_; // NOLINT(*-avoid-const-or-ref-data-members)
             std::atomic<std::uint8_t> cancel_state_{active};
             operation* cancel_link_ = nullptr;   // intrusive link for cancel_stack_
@@ -89,7 +102,7 @@ namespace coio {
         auto post_submit_sqes() -> void;
         auto request_cancel(operation& op) -> void;
         auto drain_cancels(detail::ready_queue& ready) -> void;
-        auto classify(detail::ready_queue& ready, void* user_data, int res) -> void;
+        auto classify(detail::ready_queue& ready, void* user_data, int res, unsigned flags) -> void;
 
         std::size_t pending_sqes_ = 0;
         bool enabled_ = false;
@@ -198,6 +211,59 @@ namespace coio {
         template<> auto uring_state_base_for<async_sleep_t>::complete(int) -> void;
     }
 
+    // Caller-managed provided-buffer ring for multishot receive (io_uring bufring). The kernel pulls a
+    // buffer from this group for each datagram; the CQE reports which via its buffer id (`bid`). A
+    // delivered span stays valid only until recycle(bid) hands the buffer back to the kernel. Owns a
+    // kernel registration + its backing storage → non-movable, and (like io_object) must be created and
+    // destroyed on the ring's owner thread and must outlive every multishot op naming its bgid.
+    // `count` must be a power of two (io_uring requirement); `buffer_size` is the max datagram captured.
+    class buffer_ring {
+    public:
+        buffer_ring(executor<uring_driver>& ctx, unsigned count, unsigned buffer_size, int bgid)
+            : ring_(ctx.get_driver<uring_cap>().get_uring()),
+              storage_(std::make_unique<std::byte[]>(static_cast<std::size_t>(count) * buffer_size)),
+              count_(count), buffer_size_(buffer_size),
+              mask_(::io_uring_buf_ring_mask(count)), bgid_(bgid) {
+            COIO_ASSERT(std::has_single_bit(count));
+            int err = 0;
+            br_ = ::io_uring_setup_buf_ring(ring_, count, bgid, 0, &err);
+            if (br_ == nullptr) throw std::system_error{-err, std::system_category(), "io_uring_setup_buf_ring"};
+            for (unsigned i = 0; i < count; ++i) {
+                ::io_uring_buf_ring_add(br_, addr(i), buffer_size_, static_cast<unsigned short>(i), mask_, static_cast<int>(i));
+            }
+            ::io_uring_buf_ring_advance(br_, static_cast<int>(count));
+        }
+
+        buffer_ring(const buffer_ring&) = delete;
+        auto operator= (const buffer_ring&) -> buffer_ring& = delete;
+        ~buffer_ring() {
+            if (br_ != nullptr) ::io_uring_free_buf_ring(ring_, br_, count_, bgid_);
+        }
+
+        [[nodiscard]] auto bgid() const noexcept -> int { return bgid_; }
+        [[nodiscard]] auto buffer(unsigned bid) noexcept -> std::span<std::byte> { return {addr(bid), buffer_size_}; }
+
+        // Hand a consumed buffer back to the kernel so the ring can reuse it (call once the datagram in
+        // it has been processed). Owner-thread only.
+        auto recycle(unsigned bid) noexcept -> void {
+            ::io_uring_buf_ring_add(br_, addr(bid), buffer_size_, static_cast<unsigned short>(bid), mask_, 0);
+            ::io_uring_buf_ring_advance(br_, 1);
+        }
+
+    private:
+        [[nodiscard]] auto addr(unsigned i) noexcept -> std::byte* {
+            return storage_.get() + static_cast<std::size_t>(i) * buffer_size_;
+        }
+
+        ::io_uring* ring_;
+        ::io_uring_buf_ring* br_ = nullptr;
+        std::unique_ptr<std::byte[]> storage_;
+        unsigned count_;
+        unsigned buffer_size_;
+        int mask_;
+        int bgid_;
+    };
+
     // The uring-capable scheduler: the bare placement scheduler + io ops + timers. Lives here (with
     // liburing) so execution_context.h stays backend-clean. executor<uring_driver>::scheduler resolves
     // to this via uring_driver::scheduler_of.
@@ -207,6 +273,10 @@ namespace coio {
 
     public:
         using scheduler_concept = detail::io_scheduler_tag;
+        // The provided-buffer group type for multishot receive. Naming it here (rather than the concrete
+        // buffer_ring) lets the generic socket facade take `typename IoScheduler::buffer_group&` without
+        // depending on any uring type — backends without multishot simply don't define it.
+        using buffer_group = buffer_ring;
         using base::base;
 
         // Internal, facaded by socket/file (held as their impl_). Precondition: the owning facade — and
@@ -259,7 +329,10 @@ namespace coio {
             std::atomic<int> inflight_{0};   // live ops on this fd; owner-mutated, read cross-thread at teardown
         };
 
-        template<typename Sexpr>
+        // Stoppable=false marks the op as needing no cancellation (datagram send): the op-state declares
+        // coio_unstoppable so operation_state skips the stop-callback entirely, and schedule_io skips the
+        // stop_when wrap. See uring_scheduler::schedule_io.
+        template<typename Sexpr, bool Stoppable = true>
         struct io_sender {
             using sender_concept = execution::sender_tag;
             using completion_signatures = execution::completion_signatures<
@@ -270,6 +343,8 @@ namespace coio {
 
             template<typename Rcvr>
             struct state_base : detail::uring_state_base_for<Sexpr> {
+                static constexpr bool coio_unstoppable = not Stoppable;
+
                 state_base(Executor& ctx, int fd, std::atomic<int>* inflight, Sexpr sexpr, Rcvr rcvr) noexcept
                     : detail::uring_state_base_for<Sexpr>(fd, ctx.template get_driver<uring_cap>(), std::move(sexpr)),
                       context_(ctx), inflight_(inflight), rcvr_(std::move(rcvr)) {}
@@ -319,9 +394,114 @@ namespace coio {
             return io_object{*this->ctx_, fd};
         }
 
-        template<typename Sexpr>
+        // Stoppable=false skips the per-op shutdown stop-hook. Only valid for ops that complete
+        // promptly regardless of the peer (e.g. datagram send) — such an op needs no cancellation at
+        // context shutdown because run() drains it on its own (work_count keeps the loop alive until
+        // the CQE arrives). Ops that can block indefinitely (recv/accept/connect/stream-send) MUST
+        // stay stoppable or shutdown deadlocks. The caller (socket) owns this knowledge.
+        template<bool Stoppable = true, typename Sexpr>
         [[nodiscard]] auto schedule_io(io_object& obj, Sexpr sexpr) const noexcept {
-            return stop_when(io_sender<Sexpr>{obj.fd_, this->ctx_, &obj.inflight_, std::move(sexpr)}, this->ctx_->get_stop_token());
+            io_sender<Sexpr, Stoppable> sender{obj.fd_, this->ctx_, &obj.inflight_, std::move(sexpr)};
+            if constexpr (Stoppable) return stop_when(std::move(sender), this->ctx_->get_stop_token());
+            else return sender;
+        }
+
+        // Multishot receive: one armed SQE delivers many datagrams, each into a buffer from `bufs`. `sink`
+        // is invoked per datagram ON THE OWNER THREAD with the datagram bytes (valid only for the duration
+        // of the call — the buffer is recycled to the ring immediately after). The sender completes once
+        // the multishot ends: set_stopped on cancellation, set_error on a fatal ring error, else set_value.
+        // Connected-socket only (plain RECV, no per-datagram address). This is the callback baseline the
+        // sequence-sender adapter is measured against.
+        template<typename Sink>
+        struct multishot_recv_sender {
+            using sender_concept = execution::sender_tag;
+            using completion_signatures = execution::completion_signatures<
+                execution::set_value_t(), execution::set_error_t(std::error_code), execution::set_stopped_t()>;
+
+            template<typename Rcvr>
+            struct state_base : uring_driver::operation {
+                state_base(Executor& ctx, int fd, std::atomic<int>* inflight, buffer_ring* bufs, Sink sink, Rcvr rcvr) noexcept
+                    : uring_driver::operation(ctx.template get_driver<uring_cap>()),
+                      context_(ctx), fd_(fd), inflight_(inflight), bufs_(bufs), sink_(std::move(sink)),
+                      rcvr_(std::move(rcvr)) {}
+
+                auto prepare(::io_uring_sqe* sqe) noexcept -> void override {
+                    ::io_uring_prep_recv_multishot(sqe, fd_, nullptr, 0, 0);
+                    sqe->buf_group = static_cast<unsigned short>(bufs_->bgid());
+                    sqe->flags |= IOSQE_BUFFER_SELECT;
+                }
+                auto complete(int) -> void override { coio::unreachable(); } // multishot uses on_completion
+
+                auto on_completion(int res, unsigned flags) -> bool override {
+                    if (res >= 0) {
+                        if (flags & IORING_CQE_F_BUFFER) {
+                            const unsigned bid = flags >> IORING_CQE_BUFFER_SHIFT;
+                            sink_(bufs_->buffer(bid).first(static_cast<std::size_t>(res)));
+                            bufs_->recycle(bid);
+                        }
+                        if (flags & IORING_CQE_F_MORE) return false;   // still armed for more datagrams
+                        return not rearm();                            // benign end -> re-arm, else finish (error)
+                    }
+                    const std::error_code ec{-res, std::system_category()};
+                    if (ec == std::errc::operation_canceled) { result_.set_stopped(); return true; }
+                    if (ec == std::errc::no_buffer_space and rearm()) return false; // ring drained -> re-arm
+                    result_.set_error(ec);
+                    return true;
+                }
+
+                // Re-arm the multishot. On SQE exhaustion, record the error for the terminal finish.
+                auto rearm() noexcept -> bool {
+                    if (driver_.submit(*this)) return true;
+                    result_.set_error(std::make_error_code(std::errc::no_buffer_space));
+                    return false;
+                }
+                // inflight_ marks this fd as busy for its whole armed lifetime (bumped once on start,
+                // dropped once on terminal finish — NOT per re-arm), so io_object teardown coordinates
+                // with it exactly like a single-shot op. Owner-only, single-writer (see io_sender).
+                auto do_start() noexcept -> bool {
+                    if (inflight_ != nullptr)
+                        inflight_->store(inflight_->load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+                    return rearm();
+                }
+                auto do_finish(bool) noexcept -> void {
+                    if (inflight_ != nullptr)
+                        inflight_->store(inflight_->load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+                    result_.forward_to(std::move(rcvr_));
+                }
+
+                Executor& context_; // NOLINT(*-avoid-const-or-ref-data-members)
+                int fd_;
+                std::atomic<int>* inflight_;
+                buffer_ring* bufs_;
+                Sink sink_;
+                Rcvr rcvr_;
+                async_result<execution::set_value_t(), execution::set_error_t(std::error_code)> result_;
+            };
+            template<typename Rcvr>
+            using state = detail::operation_state<state_base<Rcvr>>;
+
+            template<execution::receiver Rcvr>
+            COIO_ALWAYS_INLINE auto connect(Rcvr rcvr) && -> state<Rcvr> {
+                COIO_ASSERT(context != nullptr);
+                return state<Rcvr>{*std::exchange(context, nullptr), fd, inflight, bufs, std::move(sink), std::move(rcvr)};
+            }
+            template<similar_to<multishot_recv_sender>, typename...>
+            static consteval auto get_completion_signatures() noexcept -> completion_signatures { return {}; }
+            COIO_ALWAYS_INLINE auto get_env() const noexcept -> detail::exec_env<Executor> { return {*context}; }
+
+            Executor* context;
+            int fd;
+            std::atomic<int>* inflight;
+            buffer_ring* bufs;
+            Sink sink;
+        };
+
+        // Arm a multishot receive on `obj`'s fd, drawing datagram buffers from `bufs`. Tied to the
+        // io_object (inflight tracking + cancel_fd teardown) like every other io op. See
+        // multishot_recv_sender; facaded by basic_datagram_socket::async_receive_multishot.
+        template<typename Sink>
+        [[nodiscard]] auto receive_multishot(io_object& obj, buffer_ring& bufs, Sink sink) const noexcept {
+            return multishot_recv_sender<Sink>{this->ctx_, obj.fd_, &obj.inflight_, &bufs, std::move(sink)};
         }
 
         [[nodiscard]] static auto now() noexcept -> std::chrono::steady_clock::time_point {

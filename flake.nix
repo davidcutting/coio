@@ -31,6 +31,11 @@
               gbenchmark
               liburing
             ];
+            # mimalloc as the default allocator: buildInput so the clang wrapper puts its lib + include on
+            # the search path for find_library/find_path (see CMakeLists.txt).
+            buildInputs = with pkgs; [
+              mimalloc
+            ];
           };
         };
       };

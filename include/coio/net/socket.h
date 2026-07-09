@@ -762,6 +762,24 @@ namespace coio {
         }
 
         /**
+         * \brief receive many datagrams from one armed operation (multishot).
+         * \param buffers the caller-owned provided-buffer group the kernel draws datagram buffers from.
+         * \param sink invoked once per datagram, on the owner thread, with the datagram bytes; the span
+         *  is valid only for the duration of the call (its buffer is recycled to `buffers` immediately
+         *  after). Consumers must be synchronous.
+         * \return a sender completing when the multishot ends: stopped on cancellation, error on a fatal
+         *  ring error.
+         * \note connected-socket only (plain receive, no per-datagram source address). Only available on
+         *  schedulers whose backend supports multishot (defines `buffer_group`), e.g. io_uring.
+         */
+        template<typename BufferGroup, typename Sink>
+            requires std::same_as<BufferGroup, typename IoScheduler::buffer_group>
+        [[nodiscard]]
+        COIO_ALWAYS_INLINE auto async_receive_multishot(BufferGroup& buffers, Sink sink) {
+            return this->get_io_scheduler().receive_multishot(this->impl_, buffers, std::move(sink));
+        }
+
+        /**
          * \brief send message data asynchronously.
          * \param buffer the buffers containing the message part to send.
          * \return a sender of `std::size_t`.
@@ -773,7 +791,10 @@ namespace coio {
         */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto async_send(std::span<const std::byte> buffer) {
-            return this->get_io_scheduler().schedule_io(
+            // Datagram send completes promptly regardless of the peer, so it needs no shutdown
+            // cancellation hook (schedule_io<false>) — unlike a stream write, which can block on a
+            // full send buffer and stays stoppable.
+            return this->get_io_scheduler().template schedule_io<false>(
                 this->impl_,
                 detail::async_send_t{buffer}
             );
@@ -810,7 +831,8 @@ namespace coio {
          */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto async_send_to(std::span<const std::byte> buffer, const endpoint& peer) {
-            return this->get_io_scheduler().schedule_io(
+            // Datagram send completes promptly regardless of the peer -> no shutdown hook needed.
+            return this->get_io_scheduler().template schedule_io<false>(
                 this->impl_,
                 detail::async_send_to_t{buffer, peer}
             );

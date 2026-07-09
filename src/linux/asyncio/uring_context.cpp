@@ -91,11 +91,13 @@ namespace coio {
         submit_sqes();
     }
 
-    auto uring_driver::classify(detail::ready_queue& ready, void* user_data, int res) -> void {
+    auto uring_driver::classify(detail::ready_queue& ready, void* user_data, int res, unsigned flags) -> void {
         if (not user_data or user_data == reinterpret_cast<void*>(wake_user_data)) return;
         auto op = static_cast<operation*>(user_data);
         COIO_TSAN_ACQUIRE(op);
-        op->complete(res);
+        // Multishot ops consume many CQEs from one SQE: on_completion delivers this datagram and returns
+        // false while still armed (IORING_CQE_F_MORE), so we neither finish nor free until it returns true.
+        if (not op->on_completion(res, flags)) return;
         std::uint8_t expected = operation::active;
         if (op->cancel_state_.compare_exchange_strong(expected, operation::completed, std::memory_order_acq_rel)) {
             ready.push_back(*op);
@@ -129,7 +131,7 @@ namespace coio {
             if (n == 0) break;
             scope_exit advance{[this, n]() noexcept { ::io_uring_cq_advance(&uring_, n); }};
             for (auto* cqe : std::span(cqes, n)) {
-                classify(ready, ::io_uring_cqe_get_data(cqe), cqe->res);
+                classify(ready, ::io_uring_cqe_get_data(cqe), cqe->res, cqe->flags);
             }
             reaped += n;
         }

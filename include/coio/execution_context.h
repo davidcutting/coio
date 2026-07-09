@@ -32,13 +32,25 @@ namespace coio {
         class operation_state : public Base {
             using stop_token_t = stop_token_of_t<execution::env_of_t<decltype(std::declval<Base*>()->rcvr_)>>;
 
+            // A Base may opt out of cancellation entirely by declaring `static constexpr bool
+            // coio_unstoppable = true` (e.g. a datagram send, which completes promptly regardless of the
+            // peer). Then we skip the stop-callback install/teardown even when the awaiting task carries a
+            // stoppable token — the op simply cannot be cancelled, which is correct for such ops. Absent
+            // the declaration this defaults false, so every other op keeps today's behavior.
+            static constexpr bool base_unstoppable = [] {
+                if constexpr (requires { { Base::coio_unstoppable } -> std::convertible_to<bool>; })
+                    return Base::coio_unstoppable;
+                else return false;
+            }();
+            static constexpr bool never_stops = unstoppable_token<stop_token_t> or base_unstoppable;
+
         public:
             using operation_state_concept = execution::operation_state_tag;
             using Base::Base;
 
             auto start() & noexcept -> void {
                 this->context_.work_started();
-                if constexpr (not unstoppable_token<stop_token_t>) {
+                if constexpr (not never_stops) {
                     auto stop_token = coio::get_stop_token(execution::get_env(this->rcvr_));
                     if (stop_token.stop_requested()) {
                         this->context_.work_finished();
@@ -54,8 +66,13 @@ namespace coio {
 
             auto finish() -> void override {
                 this->context_.work_finished();
-                stop_cb_.reset();
-                this->do_finish(coio::get_stop_token(execution::get_env(this->rcvr_)).stop_requested());
+                if constexpr (not never_stops) {
+                    stop_cb_.reset();
+                    this->do_finish(coio::get_stop_token(execution::get_env(this->rcvr_)).stop_requested());
+                }
+                else {
+                    this->do_finish(false);
+                }
             }
 
         protected:

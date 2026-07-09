@@ -209,11 +209,19 @@ namespace coio {
         using scheduler_concept = detail::io_scheduler_tag;
         using base::base;
 
+        // Internal, facaded by socket/file (held as their impl_). Precondition: the owning facade — and
+        // hence this io_object — outlives and is not moved while any operation issued on it is in flight
+        // (a suspended op's awaiting coroutine already holds the facade by reference, so violating this is
+        // a use-after-free of the facade itself, independent of the ring). `inflight_` counts the live ops
+        // on this fd so teardown can tell an idle handle (safe to drop from any thread — nothing is in the
+        // ring) from one with outstanding I/O (whose cancel must reach the single-issuer owner thread).
         class io_object {
             friend uring_scheduler;
         public:
             io_object(Executor& ctx, int fd) noexcept : ctx_(&ctx), fd_(fd) {}
             io_object(const io_object&) = delete;
+            // move/swap are only valid with no ops in flight (see precondition above), so inflight_ is 0 on
+            // both sides and need not be transferred.
             io_object(io_object&& other) noexcept : ctx_(other.ctx_), fd_(std::exchange(other.fd_, -1)) {}
             ~io_object() { cancel(); }
 
@@ -230,14 +238,25 @@ namespace coio {
             auto release() -> int { cancel(); return std::exchange(fd_, -1); }
             auto cancel() -> void {
                 if (fd_ == -1) return;
-                // Teardown submits into the ring -> owner only (the single issuer). Pin sticky io to its
-                // worker so its destructor runs on-owner.
-                ctx_->template get_driver<uring_cap>().cancel_fd(fd_);
+                auto& driver = ctx_->template get_driver<uring_cap>();
+                // Reaping in-flight ops submits a cancel SQE -> owner only (the single issuer).
+                if (ctx_->is_owner()) {
+                    driver.cancel_fd(fd_);
+                }
+                else if (inflight_.load(std::memory_order_acquire) != 0) {
+                    // Off-owner with ops still in flight (discouraged — destroying a handle mid-I/O from
+                    // another thread): mail the ring-touching cancel home. Best-effort; if the owner has
+                    // already stopped, the driver destructor reaps the ring.
+                    detail::defer_to_owner(*ctx_, [&driver, fd = fd_] { driver.cancel_fd(fd); });
+                }
+                // else: idle + off-owner -> nothing is in the ring for this fd, so there is nothing to
+                // cancel and this handle can be torn down from any thread.
             }
 
         private:
             Executor* ctx_;
             int fd_ = -1;
+            std::atomic<int> inflight_{0};   // live ops on this fd; owner-mutated, read cross-thread at teardown
         };
 
         template<typename Sexpr>
@@ -251,13 +270,29 @@ namespace coio {
 
             template<typename Rcvr>
             struct state_base : detail::uring_state_base_for<Sexpr> {
-                state_base(Executor& ctx, int fd, Sexpr sexpr, Rcvr rcvr) noexcept
+                state_base(Executor& ctx, int fd, std::atomic<int>* inflight, Sexpr sexpr, Rcvr rcvr) noexcept
                     : detail::uring_state_base_for<Sexpr>(fd, ctx.template get_driver<uring_cap>(), std::move(sexpr)),
-                      context_(ctx), rcvr_(std::move(rcvr)) {}
+                      context_(ctx), inflight_(inflight), rcvr_(std::move(rcvr)) {}
 
-                COIO_ALWAYS_INLINE auto do_finish(bool) noexcept -> void { this->result.forward_to(std::move(rcvr_)); }
+                // inflight_ tracks live ops on the io_object's fd so its teardown can skip the ring when
+                // idle. Both mutations run on the OWNER (start submits into the ring -> owner only; finish
+                // runs on the run loop), so there is a single writer and teardown is the only cross-thread
+                // reader. That lets us publish with a plain relaxed load+store (a mov, not a lock-prefixed
+                // fetch_add) — a race-free program has a happens-before from an op's last activity to the
+                // handle's destruction. Timers reuse io_sender with no io_object -> inflight_ is null.
+                COIO_ALWAYS_INLINE auto do_start() noexcept -> bool {
+                    if (inflight_ != nullptr)
+                        inflight_->store(inflight_->load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+                    return detail::uring_state_base_for<Sexpr>::do_start();
+                }
+                COIO_ALWAYS_INLINE auto do_finish(bool) noexcept -> void {
+                    if (inflight_ != nullptr)
+                        inflight_->store(inflight_->load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+                    this->result.forward_to(std::move(rcvr_));
+                }
 
                 Executor& context_; // NOLINT(*-avoid-const-or-ref-data-members) — for work_started/finished
+                std::atomic<int>* inflight_;
                 Rcvr rcvr_;
             };
             template<typename Rcvr>
@@ -266,7 +301,7 @@ namespace coio {
             template<execution::receiver Rcvr>
             COIO_ALWAYS_INLINE auto connect(Rcvr rcvr) && {
                 COIO_ASSERT(context != nullptr);
-                return state<Rcvr>{*std::exchange(context, nullptr), fd, std::move(sexpr), std::move(rcvr)};
+                return state<Rcvr>{*std::exchange(context, nullptr), fd, inflight, std::move(sexpr), std::move(rcvr)};
             }
 
             template<similar_to<io_sender>, typename...>
@@ -276,6 +311,7 @@ namespace coio {
 
             int fd;
             Executor* context;
+            std::atomic<int>* inflight;   // &io_object::inflight_, or null for fd-less ops (timers)
             Sexpr sexpr;
         };
 
@@ -285,7 +321,7 @@ namespace coio {
 
         template<typename Sexpr>
         [[nodiscard]] auto schedule_io(io_object& obj, Sexpr sexpr) const noexcept {
-            return stop_when(io_sender<Sexpr>{obj.fd_, this->ctx_, std::move(sexpr)}, this->ctx_->get_stop_token());
+            return stop_when(io_sender<Sexpr>{obj.fd_, this->ctx_, &obj.inflight_, std::move(sexpr)}, this->ctx_->get_stop_token());
         }
 
         [[nodiscard]] static auto now() noexcept -> std::chrono::steady_clock::time_point {
@@ -296,7 +332,7 @@ namespace coio {
             return schedule_at(now() + d);
         }
         [[nodiscard]] auto schedule_at(std::chrono::steady_clock::time_point deadline) const noexcept {
-            return stop_when(io_sender<detail::async_sleep_t>{-1, this->ctx_, detail::async_sleep_t{deadline}},
+            return stop_when(io_sender<detail::async_sleep_t>{-1, this->ctx_, nullptr, detail::async_sleep_t{deadline}},
                              this->ctx_->get_stop_token());
         }
     };

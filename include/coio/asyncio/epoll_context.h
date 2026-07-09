@@ -9,7 +9,6 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
-#include <memory_resource>
 #include <ranges>
 #include <utility>
 #include <coio/execution_context.h>
@@ -76,10 +75,6 @@ namespace coio {
         struct operation : detail::operation_base {
             operation(epoll_driver& driver, int fd, per_fd_data* data) noexcept : driver_(driver), fd(fd), data(data) {}
 
-            // Sync completion / cross-thread cancel: post ourselves back to the executor (routes owner ->
-            // run queue, else -> inject + wake). Replaces the old context_.post_node(*this).
-            COIO_ALWAYS_INLINE auto immediately_post() -> void { driver_.post_ready(*this); }
-
         protected:
             [[nodiscard]] auto register_event(int event_type, std::uint32_t extra_flags) noexcept -> bool;
 
@@ -90,10 +85,11 @@ namespace coio {
             epoll_driver& driver_; // NOLINT(*-avoid-const-or-ref-data-members)
             int fd;
             per_fd_data* data;
+            int registered_event_ = 0; // EPOLLIN/EPOLLOUT this op registered, so cancel can deregister it
             friend epoll_driver;
         };
 
-        explicit epoll_driver(std::pmr::memory_resource& mr = *std::pmr::get_default_resource());
+        epoll_driver();
         epoll_driver(const epoll_driver&) = delete;
         ~epoll_driver();
         auto operator= (const epoll_driver&) -> epoll_driver& = delete;
@@ -102,24 +98,19 @@ namespace coio {
         auto poll(detail::ready_queue& ready, std::size_t batch) -> void;
         auto poll_wait() -> void;
         auto wake_up() noexcept -> void { interrupter_.interrupt(); }
-        auto attach(const detail::executor_sink& sink) noexcept -> void { sink_ = sink; }
 
-        // op-facing
-        [[nodiscard]] auto new_epoll_data() -> per_fd_data* { return allocator_.new_object<per_fd_data>(); }
-        auto reclaim_epoll_data(per_fd_data* data) noexcept -> void { if (data) allocator_.delete_object(data); }
-        auto cancel_op(int event, operation* op) -> void;
-        auto cancel_all(per_fd_data* data) -> void;        // io_object teardown: cancel in_op + out_op
-        auto release_fd(int fd, per_fd_data* data) -> void; // io_object release: EPOLL_CTL_DEL
+        // op-facing. Posting the deregistered ops back to the run queue is the CALLER's job (it holds the
+        // executor): a cancelling op posts itself via its context_; io_object teardown posts via its ctx_.
+        auto deregister(int event, operation* op) -> bool;                // drop op's registration; true if it was registered
+        auto cancel_all(per_fd_data* data) -> std::array<operation*, 2>;  // io_object teardown: return the deregistered ops
+        auto release_fd(int fd, per_fd_data* data) -> void;               // io_object release: EPOLL_CTL_DEL
         [[nodiscard]] auto epoll_fd() const noexcept -> int { return epoll_fd_; }
 
     private:
-        auto post_ready(operation& op) -> void { sink_.submit(op); }
         auto process_ready(detail::ready_queue& ready) -> void;
 
-        std::pmr::polymorphic_allocator<> allocator_;
         int epoll_fd_;
         detail::reactor_interrupter interrupter_;
-        detail::executor_sink sink_;
         ::epoll_event events_[128];
         int event_count_ = 0;
     };
@@ -148,7 +139,6 @@ namespace coio {
                 base1(std::move(sexpr)), epoll_driver::operation(driver, fd, data) {}
 
         protected:
-            auto do_cancel() -> void { static_assert(always_false<Sexpr>, "this operation isn't supported"); }
             auto do_start() noexcept -> bool { static_assert(always_false<Sexpr>, "this operation isn't supported"); unreachable(); }
             auto do_perform() noexcept -> bool { static_assert(always_false<Sexpr>, "this operation isn't supported"); unreachable(); }
             auto perform() noexcept -> bool override { return do_perform(); }
@@ -159,28 +149,20 @@ namespace coio {
 
         template<> auto epoll_state_base_for<async_read_some_t>::do_start() noexcept -> bool;
         template<> auto epoll_state_base_for<async_read_some_t>::do_perform() noexcept -> bool;
-        template<> auto epoll_state_base_for<async_read_some_t>::do_cancel() -> void;
         template<> auto epoll_state_base_for<async_write_some_t>::do_start() noexcept -> bool;
         template<> auto epoll_state_base_for<async_write_some_t>::do_perform() noexcept -> bool;
-        template<> auto epoll_state_base_for<async_write_some_t>::do_cancel() -> void;
         template<> auto epoll_state_base_for<async_send_t>::do_start() noexcept -> bool;
         template<> auto epoll_state_base_for<async_send_t>::do_perform() noexcept -> bool;
-        template<> auto epoll_state_base_for<async_send_t>::do_cancel() -> void;
         template<> auto epoll_state_base_for<async_receive_t>::do_start() noexcept -> bool;
         template<> auto epoll_state_base_for<async_receive_t>::do_perform() noexcept -> bool;
-        template<> auto epoll_state_base_for<async_receive_t>::do_cancel() -> void;
         template<> auto epoll_state_base_for<async_receive_from_t>::do_start() noexcept -> bool;
         template<> auto epoll_state_base_for<async_receive_from_t>::do_perform() noexcept -> bool;
-        template<> auto epoll_state_base_for<async_receive_from_t>::do_cancel() -> void;
         template<> auto epoll_state_base_for<async_send_to_t>::do_start() noexcept -> bool;
         template<> auto epoll_state_base_for<async_send_to_t>::do_perform() noexcept -> bool;
-        template<> auto epoll_state_base_for<async_send_to_t>::do_cancel() -> void;
         template<> auto epoll_state_base_for<async_accept_t>::do_start() noexcept -> bool;
         template<> auto epoll_state_base_for<async_accept_t>::do_perform() noexcept -> bool;
-        template<> auto epoll_state_base_for<async_accept_t>::do_cancel() -> void;
         template<> auto epoll_state_base_for<async_connect_t>::do_start() noexcept -> bool;
         template<> auto epoll_state_base_for<async_connect_t>::do_perform() noexcept -> bool;
-        template<> auto epoll_state_base_for<async_connect_t>::do_cancel() -> void;
     }
 
     template<typename Executor>
@@ -191,16 +173,24 @@ namespace coio {
         using scheduler_concept = detail::io_scheduler_tag;
         using base::base;
 
+        // Internal, facaded by socket/file (held as their impl_). Precondition: the owning facade — and
+        // hence this io_object — outlives every operation issued on it. That is not an extra rule: a
+        // schedule_io sender captures &impl_ and the awaiting coroutine holds the facade by reference, so
+        // destroying the facade with I/O in flight is already a use-after-free of the facade itself.
+        // Teardown cancel() is therefore best-effort for orderly shutdown (stop requested, loop drained,
+        // THEN facades destroyed) — not a license to destroy with a foreign request_stop still in flight,
+        // which would race the free of data_ against a not-yet-run finish().
         class io_object {
             friend epoll_scheduler;
             io_object(std::nullptr_t, Executor& ctx, int fd)
-                : ctx_(&ctx), fd_(fd), data_(ctx.template get_driver<epoll_cap>().new_epoll_data()) {}
+                : ctx_(&ctx), fd_(fd),
+                  data_(ctx.get_allocator().template new_object<epoll_driver::per_fd_data>()) {} // executor's mr
         public:
             io_object(Executor& ctx, int fd) : io_object(nullptr, ctx, fd) { detail::epoll_prepare_fd(fd); }
             io_object(const io_object&) = delete;
             io_object(io_object&& other) noexcept
                 : ctx_(other.ctx_), fd_(std::exchange(other.fd_, -1)), data_(std::exchange(other.data_, {})) {}
-            ~io_object() { cancel(); ctx_->template get_driver<epoll_cap>().reclaim_epoll_data(data_); }
+            ~io_object() { if (data_ != nullptr) reclaim(cancel()); }
 
             auto operator= (io_object other) noexcept -> io_object& { swap(other); return *this; }
             auto swap(io_object& o) noexcept -> void {
@@ -213,17 +203,39 @@ namespace coio {
 
             auto release() -> int {
                 if (fd_ == -1) return -1;
-                cancel();
-                ctx_->template get_driver<epoll_cap>().release_fd(fd_, data_);
-                ctx_->template get_driver<epoll_cap>().reclaim_epoll_data(std::exchange(data_, nullptr));
+                reclaim(cancel());
                 return std::exchange(fd_, -1);
             }
-            auto cancel() -> void {
-                if (fd_ == -1) return;
-                ctx_->template get_driver<epoll_cap>().cancel_all(data_);
+            // Teardown deregisters any in-flight ops and posts them (as stopped) via our own executor.
+            // Returns whether any live op was pulled (its stop callback is still armed until finish() runs).
+            auto cancel() -> bool {
+                if (fd_ == -1) return false;
+                bool had_ops = false;
+                for (auto* op : ctx_->template get_driver<epoll_cap>().cancel_all(data_)) {
+                    if (op != nullptr) { ctx_->submit(*op); had_ops = true; }
+                }
+                return had_ops;
             }
 
         private:
+            // Deregister the fd and reclaim per_fd_data. The free MUST land on the OWNER thread unless we are
+            // already the owner and cancelled nothing, because two racing readers can still touch data_:
+            //   (a) a just-cancelled op is queued with its stop callback still armed and can deref data_ via
+            //       do_cancel() until its finish() runs; and
+            //   (b) the owner may hold buffered epoll events (e.g. a peer-close EPOLLHUP) whose data.ptr is
+            //       this data_, processed on the next poll().
+            // Deferring to the owner puts the free AFTER both (FIFO behind the cancel-ops; and after the
+            // owner's event drain), so every reader sees a VALID data_ and backs off. release_fd's
+            // EPOLL_CTL_DEL first stops any NEW events. On-owner + idle has no such reader -> free inline.
+            auto reclaim(bool had_ops) -> void {
+                if (fd_ != -1) ctx_->template get_driver<epoll_cap>().release_fd(fd_, data_);
+                if (had_ops or not ctx_->is_owner())
+                    detail::defer_to_owner(*ctx_, [ctx = ctx_, d = data_] { ctx->get_allocator().delete_object(d); });
+                else
+                    ctx_->get_allocator().delete_object(data_);
+                data_ = nullptr;
+            }
+
             Executor* ctx_;
             int fd_ = -1;
             epoll_driver::per_fd_data* data_ = nullptr;
@@ -241,6 +253,12 @@ namespace coio {
                     : detail::epoll_state_base_for<Sexpr>(fd, ctx.template get_driver<epoll_cap>(), data, std::move(sexpr)),
                       context_(ctx), rcvr_(std::move(rcvr)) {}
                 COIO_ALWAYS_INLINE auto do_finish(bool) noexcept -> void { this->result.forward_to(std::move(rcvr_)); }
+                // Uniform across all io Sexprs: deregister the event we registered, and if we were still
+                // registered, post ourselves (as stopped) via our own executor.
+                auto do_cancel() -> void {
+                    if (this->registered_event_ != 0 and this->driver_.deregister(this->registered_event_, this))
+                        context_.submit(*this);
+                }
                 Executor& context_; // NOLINT
                 Rcvr rcvr_;
             };
@@ -295,7 +313,7 @@ namespace coio {
                     if (canceled) execution::set_stopped(std::move(rcvr_));
                     else result_.forward_to(std::move(rcvr_));
                 }
-                auto do_cancel() -> void { driver_.cancel_op(EPOLLIN, this); }
+                auto do_cancel() -> void { if (driver_.deregister(EPOLLIN, this)) context_.submit(*this); }
                 auto perform() noexcept -> bool override {
                     detail::epoll_drain_timerfd(this->fd);
                     result_.set_value();

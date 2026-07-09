@@ -25,20 +25,6 @@ namespace coio {
     namespace detail {
         // A run-queue node that knows its owning executor, so its op-state can submit itself onto the
         // executor's inbox. Generic over the executor type (was loop_base::node, minus the CRTP).
-        template<typename Executor>
-        struct exec_node : operation_base {
-            explicit exec_node(Executor& ex) noexcept : context_(ex) {}
-            exec_node(const exec_node&) = delete;
-            auto operator= (const exec_node&) -> exec_node& = delete;
-
-            COIO_ALWAYS_INLINE auto immediately_post() -> void {
-                COIO_ASSERT(next_ == nullptr);
-                context_.submit(*this);
-            }
-
-            Executor& context_; // NOLINT(*-avoid-const-or-ref-data-members)
-        };
-
         // The generic operation-state wrapper: work-count tracking + stop-token plumbing around a
         // backend-specific Base (which supplies context_, rcvr_, do_start(), do_finish(bool), do_cancel()).
         // Ported verbatim from loop_base::operation_state — it is entirely backend-agnostic.
@@ -61,7 +47,9 @@ namespace coio {
                     }
                     stop_cb_.emplace(std::move(stop_token), std::bind_front(&operation_state::do_cancel, this));
                 }
-                if (not this->do_start()) finish();
+                // Sync completion (do_start returned false, result already set): defer the finish by
+                // posting ourselves to the run queue via our own executor — no driver back-channel.
+                if (not this->do_start()) this->context_.submit(*this);
             }
 
             auto finish() -> void override {
@@ -74,6 +62,34 @@ namespace coio {
             using callback_t = decltype(std::bind_front(&operation_state::do_cancel, std::declval<operation_state*>()));
             std::optional<stop_callback_for_t<stop_token_t, callback_t>> stop_cb_;
         };
+
+        // A self-owned, receiver-less run-queue node: runs `fn` on the executor's owner thread, then frees
+        // itself. It is the transport for "this cleanup MUST run where the resource lives" — e.g. io_uring's
+        // single-issuer teardown, where only the owner may touch the ring. Allocated from the executor's
+        // memory resource; deletes itself inside finish().
+        template<typename F>
+        struct deferred_action : operation_base {
+            deferred_action(std::pmr::polymorphic_allocator<> alloc, F fn) noexcept
+                : alloc_(alloc), fn_(std::move(fn)) {}
+            auto finish() -> void override {
+                fn_();
+                auto alloc = alloc_;      // copy: delete_object destroys *this (and alloc_/fn_)
+                alloc.delete_object(this);
+            }
+            std::pmr::polymorphic_allocator<> alloc_;
+            F fn_;
+        };
+
+        // Fire-and-forget: run `fn` on `ctx`'s owner thread. Off-owner it rides the lock-free inject stack
+        // home; on-owner it simply runs on the next turn. WARNING: if `ctx` has already left run(), the node
+        // is never serviced and leaks — every caller must have a shutdown backstop (for io teardown that is
+        // the driver destructor, which reaps whatever is left in the ring/reactor).
+        template<typename Ctx, typename F>
+        auto defer_to_owner(Ctx& ctx, F fn) -> void {
+            std::pmr::polymorphic_allocator<> alloc = ctx.get_allocator();
+            auto* node = alloc.new_object<deferred_action<F>>(alloc, std::move(fn));
+            ctx.submit(*node);
+        }
 
         template<typename Executor>
         struct exec_env {
@@ -93,13 +109,14 @@ namespace coio {
             friend Executor;
 
             template<typename Rcvr>
-            struct state_base : exec_node<Executor> {
-                state_base(Executor& ctx, Rcvr rcvr) noexcept : exec_node<Executor>(ctx), rcvr_(std::move(rcvr)) {}
+            struct state_base : operation_base {
+                state_base(Executor& ctx, Rcvr rcvr) noexcept : context_(ctx), rcvr_(std::move(rcvr)) {}
 
-                COIO_ALWAYS_INLINE auto do_start() noexcept -> bool { this->immediately_post(); return true; }
+                COIO_ALWAYS_INLINE auto do_start() noexcept -> bool { return false; } // placement: post + finish on the loop
                 COIO_ALWAYS_INLINE auto do_finish(bool) noexcept -> void { execution::set_value(std::move(rcvr_)); }
                 COIO_ALWAYS_INLINE static auto do_cancel(state_base*) noexcept -> void {}
 
+                Executor& context_; // NOLINT(*-avoid-const-or-ref-data-members)
                 Rcvr rcvr_;
             };
             template<typename Rcvr>
@@ -184,8 +201,8 @@ namespace coio {
         using task = coio::task<T, Alloc, scheduler>;
         using wait_driver_type = WaitDrv;
 
-        executor() { attach_drivers(); }
-        explicit executor(std::pmr::memory_resource& mr) noexcept : allocator_(&mr) { attach_drivers(); }
+        executor() = default;
+        explicit executor(std::pmr::memory_resource& mr) noexcept : allocator_(&mr) {}
 
         // Construct the (sole) wait-driver in-place from Args. Drivers own kernel resources and are
         // non-movable, so they're built in the tuple, not passed by value. tuple's element-wise ctor
@@ -195,7 +212,7 @@ namespace coio {
         template<typename... Args>
             requires (sizeof...(Rest) == 0) and std::constructible_from<WaitDrv, Args&&...>
         explicit executor(std::in_place_t, Args&&... args)
-            : drivers_(std::forward<Args>(args)...) { attach_drivers(); }
+            : drivers_(std::forward<Args>(args)...) {}
 
         executor(const executor&) = delete;
         auto operator= (const executor&) -> executor& = delete;
@@ -291,17 +308,6 @@ namespace coio {
             using D = std::tuple_element_t<I, std::tuple<WaitDrv, Rest...>>;
             if constexpr (std::same_as<Cap, typename D::capability>) return std::get<I>(drivers_);
             else return pick<Cap, Rest2...>();
-        }
-
-        // Install an executor_sink on any driver that accepts one (readiness drivers post ready ops back
-        // to us outside poll()). Non-movable executor => `this` is a stable address to capture.
-        auto attach_drivers() noexcept -> void {
-            const detail::executor_sink sink{this, +[](void* e, detail::operation_base& op) noexcept {
-                static_cast<executor*>(e)->submit(op);
-            }};
-            std::apply([&](auto&... d) {
-                ([&] { if constexpr (requires { d.attach(sink); }) d.attach(sink); }(), ...);
-            }, drivers_);
         }
 
         COIO_ALWAYS_INLINE auto drain_inbox() noexcept -> void {

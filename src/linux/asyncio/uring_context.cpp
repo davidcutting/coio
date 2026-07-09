@@ -19,9 +19,12 @@ namespace coio {
                 throw std::system_error{std::make_error_code(std::errc::value_too_large)};
             }
             // DISABLED so the single-issuer owner binds when the ring is enabled on the run() thread.
+            // SUBMIT_ALL: a bad SQE doesn't abort the rest of the batch (we submit in batches). COOP_TASKRUN
+            // is only added to the non-DEFER fallback tier -- DEFER_TASKRUN already implies cooperative task
+            // running (it runs task work only on wait), so pairing COOP with it would be redundant.
             for (const unsigned flags : {
-                     unsigned{IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_R_DISABLED},
-                     unsigned{IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_R_DISABLED},
+                     unsigned{IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_R_DISABLED},
+                     unsigned{IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_R_DISABLED},
                  }) {
                 const auto ec = ::io_uring_queue_init(entries, &uring, flags);
                 if (ec == 0) return;
@@ -138,13 +141,18 @@ namespace coio {
     }
 
     auto uring_driver::poll_wait() -> void {
-        submit_sqes();
-        ::io_uring_cqe* cqe = nullptr;
-        int ec = 0;
+        // One enter flushes any pending SQEs *and* blocks for at least one CQE (native TIMEOUT SQEs wake
+        // this; no deadline needed). Replaces the old submit()+wait_cqe() two-syscall path. The return is
+        // the number of SQEs submitted (like io_uring_submit), so reconcile pending_sqes_ the same way.
+        int ret = 0;
         do {
-            ec = -::io_uring_wait_cqe(&uring_, &cqe); // native TIMEOUT SQEs wake this; no deadline needed
-        } while (ec == EINTR);
-        if (ec > 0 and ec != ETIME) throw std::system_error{ec, std::system_category()};
+            ret = ::io_uring_submit_and_wait(&uring_, 1);
+        } while (ret == -EINTR);
+        if (ret < 0 and ret != -ETIME) throw std::system_error{-ret, std::system_category()};
+        if (ret > 0) {
+            COIO_ASSERT(pending_sqes_ >= std::size_t(ret)); // NOLINT(*-use-integer-sign-comparison)
+            pending_sqes_ -= ret;
+        }
         // Leave the CQE for the next poll() to reap.
     }
 

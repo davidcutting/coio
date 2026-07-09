@@ -23,10 +23,9 @@
 #include <doctest/doctest.h>
 #include <coio/core.h>
 #include <coio/runtime.h>
-#include <coio/uring_runtime.h>
 #include <coio/asyncio/io.h>
 #include <coio/asyncio/pipe.h>
-#include <coio/asyncio/epoll_context.h>
+#include "io_contexts.h"
 
 using namespace std::chrono_literals;
 
@@ -121,14 +120,20 @@ namespace {
     }
 }
 
+#if COIO_HAS_IO_URING
 TEST_CASE("uring: idle handles dropped off-owner during a live reactor tear down cleanly") {
     run_off_owner_teardown_stress([] { return coio::uring_runtime{4}; });
 }
+#endif
 
+#if COIO_HAS_EPOLL
 TEST_CASE("epoll: idle handles dropped off-owner during a live reactor tear down cleanly") {
-    run_off_owner_teardown_stress([] {
-        return coio::basic_runtime<coio::epoll_context>{
-            4, [](std::size_t) { return std::make_unique<coio::epoll_context>(); }
-        };
-    });
+    run_off_owner_teardown_stress([] { return coio_test::make_runtime<coio::epoll_context>(4); });
 }
+#endif
+
+#if COIO_HAS_IOCP
+TEST_CASE("iocp: idle handles dropped off-owner during a live reactor tear down cleanly") {
+    run_off_owner_teardown_stress([] { return coio_test::make_runtime<coio::iocp_context>(4); });
+}
+#endif

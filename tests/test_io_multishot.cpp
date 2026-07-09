@@ -3,6 +3,9 @@
 #include <cstddef>
 #include <span>
 #include <doctest/doctest.h>
+#include <coio/detail/config.h>
+// uring-only feature: on platforms without io_uring this TU compiles to a single skip marker.
+#if COIO_HAS_IO_URING
 #include <coio/core.h>
 #include <coio/asyncio/io.h>
 #include <coio/net/socket.h>
@@ -63,3 +66,7 @@ TEST_CASE("uring multishot receive delivers every datagram") {
 
     CHECK(count.load() == n);
 }
+
+#else
+TEST_CASE("uring multishot receive (skipped: no io_uring on this platform)") { CHECK(true); }
+#endif

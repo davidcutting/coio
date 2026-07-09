@@ -6,8 +6,7 @@
 #include <coio/asyncio/io.h>
 #include <coio/net/socket.h>
 #include <coio/net/tcp.h>
-#include <coio/asyncio/epoll_context.h>
-#include <coio/asyncio/uring_context.h>
+#include "io_contexts.h"
 
 using namespace std::chrono_literals;
 
@@ -33,7 +32,7 @@ namespace {
 }
 
 TEST_CASE_TEMPLATE("tcp loopback echo roundtrip drives accept/connect/read/write", Ctx,
-                   coio::epoll_context, coio::uring_context) {
+                   COIO_TEST_IO_CONTEXTS) {
     using acceptor_t = coio::tcp::acceptor<typename Ctx::scheduler>;
     using socket_t = coio::tcp::socket<typename Ctx::scheduler>;
 
@@ -69,7 +68,7 @@ TEST_CASE_TEMPLATE("tcp loopback echo roundtrip drives accept/connect/read/write
 }
 
 TEST_CASE_TEMPLATE("a server-side tcp read is cancelled by a timeout while the peer stays idle", Ctx,
-                   coio::epoll_context, coio::uring_context) {
+                   COIO_TEST_IO_CONTEXTS) {
     using acceptor_t = coio::tcp::acceptor<typename Ctx::scheduler>;
     using socket_t = coio::tcp::socket<typename Ctx::scheduler>;
 

@@ -6,10 +6,9 @@
 #include <doctest/doctest.h>
 #include <coio/core.h>
 #include <coio/runtime.h>
-#include <coio/uring_runtime.h>
 #include <coio/asyncio/io.h>
 #include <coio/asyncio/pipe.h>
-#include <coio/asyncio/epoll_context.h>
+#include "io_contexts.h"
 
 using namespace std::chrono_literals;
 
@@ -54,14 +53,20 @@ namespace {
     }
 }
 
+#if COIO_HAS_IO_URING
 TEST_CASE("uring runtime: pinned in-flight reads are cancelled cross-thread at teardown") {
     run_teardown_cancel([] { return coio::uring_runtime{3}; });
 }
+#endif
 
+#if COIO_HAS_EPOLL
 TEST_CASE("epoll runtime: pinned in-flight reads are cancelled cross-thread at teardown") {
-    run_teardown_cancel([] {
-        return coio::basic_runtime<coio::epoll_context>{
-            3, [](std::size_t) { return std::make_unique<coio::epoll_context>(); }
-        };
-    });
+    run_teardown_cancel([] { return coio_test::make_runtime<coio::epoll_context>(3); });
 }
+#endif
+
+#if COIO_HAS_IOCP
+TEST_CASE("iocp runtime: pinned in-flight reads are cancelled cross-thread at teardown") {
+    run_teardown_cancel([] { return coio_test::make_runtime<coio::iocp_context>(3); });
+}
+#endif

@@ -18,9 +18,14 @@ namespace coio {
         using file_native_handle_type = void*;
 
         inline const file_native_handle_type invalid_file_handle = reinterpret_cast<void*>(std::uintptr_t(-1)); // NOLINT(*-misplaced-const)
+#endif
+
         // Bridge between the file layer's raw handle (void* HANDLE on Windows, int fd elsewhere) and the
         // opaque-handle codec's native_fd currency (net/basic.h). On POSIX the two coincide; on Windows
         // the HANDLE bits ride the codec unchanged (INVALID_HANDLE_VALUE <-> the empty handle: all-ones).
+        // NOTE: this is a SEPARATE conditional from the type definitions above — to_native_file must be
+        // defined on every platform (the Windows branch also adds the to_handle(HANDLE) overload).
+#if COIO_OS_WINDOWS
         [[nodiscard]] inline auto to_handle(file_native_handle_type handle) noexcept -> native_handle {
             return to_handle(std::bit_cast<native_fd>(handle));
         }

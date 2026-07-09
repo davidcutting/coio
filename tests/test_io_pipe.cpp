@@ -5,8 +5,7 @@
 #include <coio/core.h>
 #include <coio/asyncio/io.h>
 #include <coio/asyncio/pipe.h>
-#include <coio/asyncio/epoll_context.h>
-#include <coio/asyncio/uring_context.h>
+#include "io_contexts.h"
 
 using namespace std::chrono_literals;
 
@@ -32,7 +31,7 @@ namespace {
 }
 
 TEST_CASE_TEMPLATE("pipe write/read roundtrip drives the reactor completion path", Ctx,
-                   coio::epoll_context, coio::uring_context) {
+                   COIO_TEST_IO_CONTEXTS) {
     Ctx context;
     auto [reader, writer] = coio::make_pipe(context.get_scheduler());
     coio::async_scope scope;
@@ -60,7 +59,7 @@ TEST_CASE_TEMPLATE("pipe write/read roundtrip drives the reactor completion path
 }
 
 TEST_CASE_TEMPLATE("a blocking pipe read is cancelled by a timeout", Ctx,
-                   coio::epoll_context, coio::uring_context) {
+                   COIO_TEST_IO_CONTEXTS) {
     Ctx context;
     auto [reader, writer] = coio::make_pipe(context.get_scheduler());
     coio::async_scope scope;

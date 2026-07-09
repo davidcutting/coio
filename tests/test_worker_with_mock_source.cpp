@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <vector>
 #include <doctest/doctest.h>
-#include <coio/asyncio/uring_context.h>
+#include "io_contexts.h"
 #include <coio/detail/operation_base.h>
 
 namespace {
@@ -13,7 +13,7 @@ namespace {
 }
 
 TEST_CASE("a single-issuer worker runs operations posted to its inbox and then drains") {
-    coio::uring_context worker;
+    coio_test::default_io_context worker;
 
     std::atomic<int> counter{0};
     constexpr int op_count = 50;

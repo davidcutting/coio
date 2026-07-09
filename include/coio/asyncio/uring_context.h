@@ -21,9 +21,10 @@
 #include <coio/utils/async_result.h>
 #include <coio/utils/stop_token.h>
 #include <coio/detail/io_descriptions.h>
+#include <coio/detail/io_sender.h>
 
 namespace coio {
-    template<typename Executor>
+    template<typename Executor, typename Base = detail::executor_scheduler<Executor>>
     class uring_scheduler;
 
     // Defined below uring_scheduler (its ctor needs the uring_context alias), but named in the scheduler's
@@ -46,8 +47,10 @@ namespace coio {
     public:
         // io via ring SQEs; timer via the native timeout op (async_sleep_t).
         using capabilities = type_list<capability::io, capability::timer>;
-        template<typename Executor>
-        using scheduler_of = uring_scheduler<Executor>;
+        // The scheduler fragment this driver contributes (see detail::compose_scheduler): io_handle +
+        // schedule_io + multishot receive + TIMEOUT-backed timed scheduling, layered onto Base.
+        template<typename Executor, typename Base>
+        using scheduler_mixin = uring_scheduler<Executor, Base>;
 
         // = the old uring_node. Cancellation state + hooks the driver dispatches through.
         struct operation : detail::operation_base {
@@ -75,6 +78,29 @@ namespace coio {
             bool completion_ready_ = false;       // owner-only: CQE arrived while a cancel was queued
         };
 
+        // What one in-flight op needs to target a registration: a non-owning borrow of the scheduler's
+        // io_handle, valid only while it lives. Ferried opaquely by the generic detail::io_sender.
+        // Default-constructed = fd-less op (a timer): no handle, no inflight tracking.
+        struct io_ref {
+            int fd = -1;
+            std::atomic<int>* inflight = nullptr;   // &io_handle::inflight_, or null for fd-less ops
+        };
+
+        // The ops this driver implements (= the uring_state_base_for prepare() specializations below/.cpp),
+        // in one visible list; detail::schedule_io static_asserts against it.
+        using supported_io_ops = type_list<
+            detail::async_read_some_t, detail::async_write_some_t,
+            detail::async_read_some_at_t, detail::async_write_some_at_t,
+            detail::async_stream_send_t, detail::async_datagram_send_t,
+            detail::async_receive_t, detail::async_receive_from_t, detail::async_send_to_t,
+            detail::async_accept_t, detail::async_connect_t, detail::async_sleep_t>;
+        template<typename IoOp>
+        static constexpr bool supports = supported_io_ops::template contains<IoOp>;
+
+        // The per-op state base the generic detail::io_sender derives from.
+        template<typename IoOp>
+        using io_state = detail::uring_state_base_for<IoOp>;
+
         explicit uring_driver(std::size_t entries);
         uring_driver();
         uring_driver(const uring_driver&) = delete;
@@ -88,7 +114,7 @@ namespace coio {
 
         // ---- op-facing ----
         auto submit(operation& op) -> bool;   // grab an SQE, op.prepare(it), set_data; false if exhausted
-        auto cancel_fd(int fd) -> void;        // OWNER only: cancel all ops on fd (io_object teardown)
+        auto cancel_fd(int fd) -> void;        // OWNER only: cancel all ops on fd (io_handle teardown)
 
         [[nodiscard]] auto get_uring() noexcept -> ::io_uring* { return &uring_; }
         [[nodiscard]] auto is_owner() const noexcept -> bool {
@@ -160,15 +186,23 @@ namespace coio {
             using base1 = typename uring_sexpr_wrapper<Sexpr>::type;
 
         public:
-            uring_state_base_for(int fd, uring_driver& driver, Sexpr sexpr) noexcept :
-                base1(std::move(sexpr)), uring_driver::operation(driver), fd(fd) {}
+            uring_state_base_for(uring_driver& driver, uring_driver::io_ref ref, Sexpr sexpr) noexcept :
+                base1(std::move(sexpr)), uring_driver::operation(driver), fd(ref.fd), inflight_(ref.inflight) {}
 
         protected:
             auto prepare(::io_uring_sqe*) noexcept -> void override {
                 static_assert(always_false<Sexpr>, "this operation isn't supported");
             }
 
+            // inflight_ tracks live ops on the io_handle's fd so its teardown can skip the ring when
+            // idle. Both mutations run on the OWNER (start submits into the ring -> owner only; finish
+            // runs on the run loop), so there is a single writer and teardown is the only cross-thread
+            // reader. That lets us publish with a plain relaxed load+store (a mov, not a lock-prefixed
+            // fetch_add) — a race-free program has a happens-before from an op's last activity to the
+            // handle's destruction. Timers are fd-less -> inflight_ is null.
             auto do_start() noexcept -> bool {
+                if (inflight_ != nullptr)
+                    inflight_->store(inflight_->load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
                 if (not driver_.submit(*this)) {
                     result.set_error(std::make_error_code(std::errc::no_buffer_space));
                     return false;
@@ -191,8 +225,21 @@ namespace coio {
                 return true;
             }
 
+            // Generic io_sender hooks. try_cancel: request an async cancel through the ring (the CQE flow
+            // completes the cancellation), so the caller never posts us — always false. on_finish: drop
+            // the inflight count before the result is delivered (see do_start).
+            auto try_cancel() -> bool {
+                uring_driver::operation::do_cancel();
+                return false;
+            }
+            auto on_finish() noexcept -> void {
+                if (inflight_ != nullptr)
+                    inflight_->store(inflight_->load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+            }
+
         protected:
             int fd;
+            std::atomic<int>* inflight_;
             async_result<typename Sexpr::value_signature, execution::set_error_t(std::error_code)> result;
         };
 
@@ -202,7 +249,8 @@ namespace coio {
         template<> auto uring_state_base_for<async_read_some_at_t>::prepare(::io_uring_sqe*) noexcept -> void;
         template<> auto uring_state_base_for<async_write_some_at_t>::prepare(::io_uring_sqe*) noexcept -> void;
         template<> auto uring_state_base_for<async_receive_t>::prepare(::io_uring_sqe*) noexcept -> void;
-        template<> auto uring_state_base_for<async_send_t>::prepare(::io_uring_sqe*) noexcept -> void;
+        template<> auto uring_state_base_for<async_stream_send_t>::prepare(::io_uring_sqe*) noexcept -> void;
+        template<> auto uring_state_base_for<async_datagram_send_t>::prepare(::io_uring_sqe*) noexcept -> void;
         template<> auto uring_state_base_for<async_receive_from_t>::prepare(::io_uring_sqe*) noexcept -> void;
         template<> auto uring_state_base_for<async_receive_from_t>::on_completion(int, unsigned) -> bool;
         template<> auto uring_state_base_for<async_send_to_t>::prepare(::io_uring_sqe*) noexcept -> void;
@@ -217,7 +265,7 @@ namespace coio {
     // Caller-managed provided-buffer ring for multishot receive (io_uring bufring). The kernel pulls a
     // buffer from this group for each datagram; the CQE reports which via its buffer id (`bid`). A
     // delivered span stays valid only until recycle(bid) hands the buffer back to the kernel. Owns a
-    // kernel registration + its backing storage → non-movable, and (like io_object) must be created and
+    // kernel registration + its backing storage → non-movable, and (like io_handle) must be created and
     // destroyed on the ring's owner thread and must outlive every multishot op naming its bgid.
     // `count` must be a power of two (io_uring requirement); `buffer_size` is the max datagram captured.
     class buffer_ring {
@@ -267,13 +315,13 @@ namespace coio {
         int bgid_;
     };
 
-    // The uring-capable scheduler: the bare placement scheduler + io ops + timers. Lives here (with
-    // liburing) so execution_context.h stays backend-clean. executor<uring_driver>::scheduler resolves
-    // to this via uring_driver::scheduler_of.
-    template<typename Executor>
-    class uring_scheduler : public detail::executor_scheduler<Executor> {
-        using base = detail::executor_scheduler<Executor>;
-
+    // A scheduler mixin (not a standalone scheduler): adds uring's io ops + timers on top of Base, which
+    // is executor_scheduler or another driver's mixin. Lives here (with liburing) so
+    // execution_context.h stays backend-clean; executor<uring_driver>::scheduler composes this via
+    // uring_driver::scheduler_mixin. The default Base keeps the plain `uring_scheduler<Ex>` spelling
+    // equal to uring_context's composed scheduler type.
+    template<typename Executor, typename Base>
+    class uring_scheduler : public Base {
     public:
         using scheduler_concept = detail::io_scheduler_tag;
         // The opaque handle this backend hands out. Identity codec today (bits == fd); becomes a registered
@@ -283,27 +331,27 @@ namespace coio {
         // buffer_ring) lets the generic socket facade take `typename IoScheduler::buffer_group&` without
         // depending on any uring type — backends without multishot simply don't define it.
         using buffer_group = buffer_ring;
-        using base::base;
+        using Base::Base;
 
         // Internal, facaded by socket/file (held as their impl_). Precondition: the owning facade — and
-        // hence this io_object — outlives and is not moved while any operation issued on it is in flight
+        // hence this io_handle — outlives and is not moved while any operation issued on it is in flight
         // (a suspended op's awaiting coroutine already holds the facade by reference, so violating this is
         // a use-after-free of the facade itself, independent of the ring). `inflight_` counts the live ops
         // on this fd so teardown can tell an idle handle (safe to drop from any thread — nothing is in the
         // ring) from one with outstanding I/O (whose cancel must reach the single-issuer owner thread).
-        class io_object {
+        class io_handle {
             friend uring_scheduler;
         public:
-            io_object(Executor& ctx, int fd) noexcept : ctx_(&ctx), fd_(fd) {}
-            io_object(const io_object&) = delete;
+            io_handle(Executor& ctx, int fd) noexcept : ctx_(&ctx), fd_(fd) {}
+            io_handle(const io_handle&) = delete;
             // move/swap are only valid with no ops in flight (see precondition above), so inflight_ is 0 on
             // both sides and need not be transferred.
-            io_object(io_object&& other) noexcept : ctx_(other.ctx_), fd_(std::exchange(other.fd_, -1)) {}
-            ~io_object() { cancel(); }
+            io_handle(io_handle&& other) noexcept : ctx_(other.ctx_), fd_(std::exchange(other.fd_, -1)) {}
+            ~io_handle() { cancel(); }
 
-            auto operator= (io_object other) noexcept -> io_object& { swap(other); return *this; }
-            auto swap(io_object& other) noexcept -> void { std::ranges::swap(ctx_, other.ctx_); std::ranges::swap(fd_, other.fd_); }
-            friend auto swap(io_object& a, io_object& b) noexcept -> void { a.swap(b); }
+            auto operator= (io_handle other) noexcept -> io_handle& { swap(other); return *this; }
+            auto swap(io_handle& other) noexcept -> void { std::ranges::swap(ctx_, other.ctx_); std::ranges::swap(fd_, other.fd_); }
+            friend auto swap(io_handle& a, io_handle& b) noexcept -> void { a.swap(b); }
 
             [[nodiscard]] auto get_io_scheduler() const noexcept -> uring_scheduler {
                 COIO_ASSERT(ctx_ != nullptr);
@@ -332,86 +380,27 @@ namespace coio {
             }
 
         private:
+            // The op-facing borrow of this registration (see uring_driver::io_ref).
+            [[nodiscard]] auto ref() noexcept -> uring_driver::io_ref { return {fd_, &inflight_}; }
+
             Executor* ctx_;
             int fd_ = -1;
             std::atomic<int> inflight_{0};   // live ops on this fd; owner-mutated, read cross-thread at teardown
         };
 
-        // Stoppable=false marks the op as needing no cancellation (datagram send): the op-state declares
-        // coio_unstoppable so operation_state skips the stop-callback entirely, and schedule_io skips the
-        // stop_when wrap. See uring_scheduler::schedule_io.
-        template<typename Sexpr, bool Stoppable = true>
-        struct io_sender {
-            using sender_concept = execution::sender_tag;
-            using completion_signatures = execution::completion_signatures<
-                typename Sexpr::value_signature,
-                execution::set_error_t(std::error_code),
-                execution::set_stopped_t()
-            >;
-
-            template<typename Rcvr>
-            struct state_base : detail::uring_state_base_for<Sexpr> {
-                static constexpr bool coio_unstoppable = not Stoppable;
-
-                state_base(Executor& ctx, int fd, std::atomic<int>* inflight, Sexpr sexpr, Rcvr rcvr) noexcept
-                    : detail::uring_state_base_for<Sexpr>(fd, ctx.template get_driver<capability::io>(), std::move(sexpr)),
-                      context_(ctx), inflight_(inflight), rcvr_(std::move(rcvr)) {}
-
-                // inflight_ tracks live ops on the io_object's fd so its teardown can skip the ring when
-                // idle. Both mutations run on the OWNER (start submits into the ring -> owner only; finish
-                // runs on the run loop), so there is a single writer and teardown is the only cross-thread
-                // reader. That lets us publish with a plain relaxed load+store (a mov, not a lock-prefixed
-                // fetch_add) — a race-free program has a happens-before from an op's last activity to the
-                // handle's destruction. Timers reuse io_sender with no io_object -> inflight_ is null.
-                COIO_ALWAYS_INLINE auto do_start() noexcept -> bool {
-                    if (inflight_ != nullptr)
-                        inflight_->store(inflight_->load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-                    return detail::uring_state_base_for<Sexpr>::do_start();
-                }
-                COIO_ALWAYS_INLINE auto do_finish(bool) noexcept -> void {
-                    if (inflight_ != nullptr)
-                        inflight_->store(inflight_->load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
-                    this->result.forward_to(std::move(rcvr_));
-                }
-
-                Executor& context_; // NOLINT(*-avoid-const-or-ref-data-members) — for work_started/finished
-                std::atomic<int>* inflight_;
-                Rcvr rcvr_;
-            };
-            template<typename Rcvr>
-            using state = detail::operation_state<state_base<Rcvr>>;
-
-            template<execution::receiver Rcvr>
-            COIO_ALWAYS_INLINE auto connect(Rcvr rcvr) && {
-                COIO_ASSERT(context != nullptr);
-                return state<Rcvr>{*std::exchange(context, nullptr), fd, inflight, std::move(sexpr), std::move(rcvr)};
-            }
-
-            template<similar_to<io_sender>, typename...>
-            static consteval auto get_completion_signatures() noexcept -> completion_signatures { return {}; }
-
-            COIO_ALWAYS_INLINE auto get_env() const noexcept -> detail::exec_env<Executor> { return {*context}; }
-
-            int fd;
-            Executor* context;
-            std::atomic<int>* inflight;   // &io_object::inflight_, or null for fd-less ops (timers)
-            Sexpr sexpr;
-        };
-
-        [[nodiscard]] auto make_io_object(detail::native_handle handle) const -> io_object {
-            return io_object{*this->ctx_, detail::to_native(handle)}; // decode at the boundary; internals hold the fd
+        [[nodiscard]] auto make_io_handle(detail::native_handle handle) const -> io_handle {
+            return io_handle{*this->ctx_, detail::to_native(handle)}; // decode at the boundary; internals hold the fd
         }
 
-        // Stoppable=false skips the per-op shutdown stop-hook. Only valid for ops that complete
-        // promptly regardless of the peer (e.g. datagram send) — such an op needs no cancellation at
-        // context shutdown because run() drains it on its own (work_count keeps the loop alive until
-        // the CQE arrives). Ops that can block indefinitely (recv/accept/connect/stream-send) MUST
-        // stay stoppable or shutdown deadlocks. The caller (socket) owns this knowledge.
-        template<bool Stoppable = true, typename Sexpr>
-        [[nodiscard]] auto schedule_io(io_object& obj, Sexpr sexpr) const noexcept {
-            io_sender<Sexpr, Stoppable> sender{obj.fd_, this->ctx_, &obj.inflight_, std::move(sexpr)};
-            if constexpr (Stoppable) return stop_when(std::move(sender), this->ctx_->get_stop_token());
-            else return sender;
+        // One generic sender serves every io op (detail::io_sender); this driver contributes io_ref +
+        // io_state<IoOp>. An unstoppable description (detail::is_unstoppable — e.g. datagram send) skips
+        // the per-op shutdown stop-hook there: it completes promptly regardless of the peer, so run()
+        // drains it on its own (work_count keeps the loop alive until the CQE arrives). Ops that can block
+        // indefinitely (recv/accept/connect/stream-send) declare nothing and stay stoppable, or shutdown
+        // deadlocks. The description owns this.
+        template<typename Sexpr>
+        [[nodiscard]] auto schedule_io(io_handle& obj, Sexpr sexpr) const noexcept {
+            return detail::schedule_io(*this->ctx_, obj.ref(), std::move(sexpr));
         }
 
         // Multishot receive: one armed SQE delivers many datagrams, each into a buffer from `bufs`. `sink`
@@ -463,7 +452,7 @@ namespace coio {
                     return false;
                 }
                 // inflight_ marks this fd as busy for its whole armed lifetime (bumped once on start,
-                // dropped once on terminal finish — NOT per re-arm), so io_object teardown coordinates
+                // dropped once on terminal finish — NOT per re-arm), so io_handle teardown coordinates
                 // with it exactly like a single-shot op. Owner-only, single-writer (see io_sender).
                 auto do_start() noexcept -> bool {
                     if (inflight_ != nullptr)
@@ -504,10 +493,10 @@ namespace coio {
         };
 
         // Arm a multishot receive on `obj`'s fd, drawing datagram buffers from `bufs`. Tied to the
-        // io_object (inflight tracking + cancel_fd teardown) like every other io op. See
+        // io_handle (inflight tracking + cancel_fd teardown) like every other io op. See
         // multishot_recv_sender; facaded by basic_datagram_socket::async_receive_multishot.
         template<typename Sink>
-        [[nodiscard]] auto receive_multishot(io_object& obj, buffer_ring& bufs, Sink sink) const noexcept {
+        [[nodiscard]] auto receive_multishot(io_handle& obj, buffer_ring& bufs, Sink sink) const noexcept {
             return multishot_recv_sender<Sink>{this->ctx_, obj.fd_, &obj.inflight_, &bufs, std::move(sink)};
         }
 
@@ -519,8 +508,8 @@ namespace coio {
             return schedule_at(now() + d);
         }
         [[nodiscard]] auto schedule_at(std::chrono::steady_clock::time_point deadline) const noexcept {
-            return stop_when(io_sender<detail::async_sleep_t>{-1, this->ctx_, nullptr, detail::async_sleep_t{deadline}},
-                             this->ctx_->get_stop_token());
+            // A timer is an fd-less io op (default io_ref): a TIMEOUT SQE through the same machinery.
+            return detail::schedule_io(*this->ctx_, uring_driver::io_ref{}, detail::async_sleep_t{deadline});
         }
     };
 

@@ -1,4 +1,4 @@
-// Stress test for off-owner io_object teardown — the hardened path from the driver refactor.
+// Stress test for off-owner io_handle teardown — the hardened path from the driver refactor.
 //
 // The real-world hazard (case #1): a handle is used correctly on its owner worker, but its last owning
 // reference (here a shared_ptr) is dropped by a DIFFERENT thread after the I/O is done. uring must not

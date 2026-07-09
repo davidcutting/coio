@@ -12,7 +12,7 @@
 #include <coio/detail/suppress_push.h> // IWYU pragma: keep
 
 namespace coio {
-    template<typename Executor>
+    template<typename Executor, typename Base = detail::executor_scheduler<Executor>>
     class timer_scheduler;
 
     // A single-owner timer wait-owner: no ring, just a deadline heap + a semaphore to sleep on. This is
@@ -21,8 +21,10 @@ namespace coio {
     class timer_driver {
     public:
         using capabilities = type_list<capability::timer>;
-        template<typename Executor>
-        using scheduler_of = timer_scheduler<Executor>;
+        // The scheduler fragment this driver contributes (see detail::compose_scheduler): timed
+        // scheduling (now/schedule_at/schedule_after) layered onto whatever surface Base already has.
+        template<typename Executor, typename Base>
+        using scheduler_mixin = timer_scheduler<Executor, Base>;
 
         struct operation : detail::operation_base {
             std::chrono::steady_clock::time_point deadline;
@@ -63,10 +65,11 @@ namespace coio {
         std::counting_semaphore<> sema_{0};
     };
 
-    template<typename Executor>
-    class timer_scheduler : public detail::executor_scheduler<Executor> {
-        using base = detail::executor_scheduler<Executor>;
-
+    // A scheduler mixin (not a standalone scheduler): adds the timer capability's senders on top of
+    // Base, which is executor_scheduler or another driver's mixin. The default Base keeps the plain
+    // `timer_scheduler<Ex>` spelling equal to time_loop's composed scheduler type.
+    template<typename Executor, typename Base>
+    class timer_scheduler : public Base {
         struct sleep_sender {
             using sender_concept = execution::sender_tag;
             using completion_signatures = execution::completion_signatures<
@@ -109,7 +112,7 @@ namespace coio {
         };
 
     public:
-        using base::base;
+        using Base::Base;
 
         [[nodiscard]] static auto now() noexcept -> std::chrono::steady_clock::time_point {
             return std::chrono::steady_clock::now();

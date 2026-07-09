@@ -77,7 +77,7 @@ namespace coio {
         ::CancelIoEx(handle, this);
     }
 
-    iocp_context::scheduler::io_object::io_object(iocp_context& ctx, ::HANDLE handle)
+    iocp_context::scheduler::io_handle::io_handle(iocp_context& ctx, ::HANDLE handle)
         : ctx_(&ctx), handle_(handle) {
         // NOTE: `handle` must be opend with `FILE_FLAG_OVERLAPPED` or `WSA_FLAG_OVERLAPPED`
         if (handle != INVALID_HANDLE_VALUE and handle != nullptr) {
@@ -85,16 +85,16 @@ namespace coio {
                 offset_ = static_cast<std::size_t>(current.QuadPart);
             }
             if (::CreateIoCompletionPort(handle, ctx.iocp_, 0, 0) == nullptr) {
-                throw std::system_error{detail::to_error_code(::GetLastError()), "iocp_context::make_io_object"};
+                throw std::system_error{detail::to_error_code(::GetLastError()), "iocp_context::make_io_handle"};
             }
         }
     }
 
-    iocp_context::scheduler::io_object::~io_object() {
+    iocp_context::scheduler::io_handle::~io_handle() {
         cancel();
     }
 
-    auto iocp_context::scheduler::io_object::release() -> handle_wrapper {
+    auto iocp_context::scheduler::io_handle::release() -> handle_wrapper {
         if (handle_ != INVALID_HANDLE_VALUE) {
             cancel();
             detail::deassociate_iocp(handle_);
@@ -103,18 +103,18 @@ namespace coio {
         return handle_wrapper{std::exchange(handle_, INVALID_HANDLE_VALUE)};
     }
 
-    auto iocp_context::scheduler::io_object::cancel() -> void {
+    auto iocp_context::scheduler::io_handle::cancel() -> void {
         if (handle_ == INVALID_HANDLE_VALUE) return;
         ::CancelIoEx(handle_, nullptr);
     }
 
-    auto iocp_context::scheduler::io_object::file_resize(std::size_t new_size) -> void {
+    auto iocp_context::scheduler::io_handle::file_resize(std::size_t new_size) -> void {
         detail::throw_win_error(::SetFilePointerEx(handle_, {.QuadPart = ::LONGLONG(new_size)}, nullptr, FILE_BEGIN), "resize");
         detail::throw_win_error(::SetEndOfFile(handle_), "resize");
         detail::throw_win_error(::SetFilePointerEx(handle_, {.QuadPart = ::LONGLONG(offset_)}, nullptr, FILE_BEGIN), "resize");
     }
 
-    auto iocp_context::scheduler::io_object::file_seek(std::size_t offset, detail::seek_whence whence) -> std::size_t {
+    auto iocp_context::scheduler::io_handle::file_seek(std::size_t offset, detail::seek_whence whence) -> std::size_t {
         if (handle_ == INVALID_HANDLE_VALUE) {
             throw std::system_error{std::make_error_code(std::errc::bad_file_descriptor), "seek"};
         }
@@ -143,13 +143,13 @@ namespace coio {
         return offset_ = static_cast<std::size_t>(new_offset.QuadPart);
     }
 
-    auto iocp_context::scheduler::io_object::file_read(std::span<std::byte> buffer) -> std::size_t {
+    auto iocp_context::scheduler::io_handle::file_read(std::span<std::byte> buffer) -> std::size_t {
         const auto n = detail::file_read_at(handle_, offset_, buffer);
         offset_ += n;
         return n;
     }
 
-    auto iocp_context::scheduler::io_object::file_write(std::span<const std::byte> buffer) -> std::size_t {
+    auto iocp_context::scheduler::io_handle::file_write(std::span<const std::byte> buffer) -> std::size_t {
         const auto n = detail::file_write_at(handle_, offset_, buffer);
         offset_ += n;
         return n;
@@ -477,9 +477,10 @@ namespace coio {
             }
         }
 
-        /// async_send
+        /// async_send — stream and datagram share the WSASend impl; separate types so stoppability is
+        /// deduced from the description (datagram = unstoppable). Identical bodies today.
         template<>
-        auto iocp_state_base_for<async_send_t>::do_start() noexcept -> bool {
+        auto iocp_state_base_for<async_stream_send_t>::do_start() noexcept -> bool {
             if (handle == INVALID_HANDLE_VALUE) [[unlikely]] {
                 result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
                 return false;
@@ -489,7 +490,7 @@ namespace coio {
                 immediately_post();
                 return true;
             }
-            
+
             ::WSABUF wsabuf = span_to_wsabuf(buffer);
             ::DWORD bytes_sent = 0;
             const int rc = ::WSASend(
@@ -511,7 +512,55 @@ namespace coio {
         }
 
         template<>
-        auto iocp_state_base_for<async_send_t>::complete(::DWORD bytes, ::DWORD error) noexcept -> void {
+        auto iocp_state_base_for<async_stream_send_t>::complete(::DWORD bytes, ::DWORD error) noexcept -> void {
+            if (error) {
+                if (error == ERROR_OPERATION_ABORTED) {
+                    result.set_stopped();
+                    return;
+                }
+                if (error == ERROR_NETNAME_DELETED) error = WSAECONNRESET;
+                else if (error == ERROR_PORT_UNREACHABLE) error = WSAECONNREFUSED;
+                result.set_error(to_error_code(error));
+            }
+            else {
+                result.set_value(bytes);
+            }
+        }
+
+        template<>
+        auto iocp_state_base_for<async_datagram_send_t>::do_start() noexcept -> bool {
+            if (handle == INVALID_HANDLE_VALUE) [[unlikely]] {
+                result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
+                return false;
+            }
+            if (buffer.empty()) [[unlikely]] {
+                result.set_value(0);
+                immediately_post();
+                return true;
+            }
+
+            ::WSABUF wsabuf = span_to_wsabuf(buffer);
+            ::DWORD bytes_sent = 0;
+            const int rc = ::WSASend(
+                std::bit_cast<::SOCKET>(handle),
+                &wsabuf,
+                1,
+                &bytes_sent,
+                0,
+                this,
+                nullptr
+            );
+            if (rc == SOCKET_ERROR) {
+                const int err = ::WSAGetLastError();
+                if (err == WSA_IO_PENDING) return true;
+                complete(0, static_cast<::DWORD>(err));
+                return false;
+            }
+            return true;
+        }
+
+        template<>
+        auto iocp_state_base_for<async_datagram_send_t>::complete(::DWORD bytes, ::DWORD error) noexcept -> void {
             if (error) {
                 if (error == ERROR_OPERATION_ABORTED) {
                     result.set_stopped();

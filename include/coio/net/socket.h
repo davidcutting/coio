@@ -241,7 +241,7 @@ namespace coio {
     template<typename Protocol, io_scheduler IoScheduler>
     class basic_socket {
     private:
-        using implementation_type = decltype(std::declval<IoScheduler&>().make_io_object(std::declval<typename IoScheduler::native_handle_type>()));
+        using implementation_type = decltype(std::declval<IoScheduler&>().make_io_handle(std::declval<typename IoScheduler::native_handle_type>()));
 
     public:
         using protocol_type = Protocol;
@@ -273,7 +273,7 @@ namespace coio {
             basic_socket(std::move(scheduler), native_handle_type{}) {}
 
         basic_socket(scheduler_type scheduler, native_handle_type handle) :
-            impl_(scheduler.make_io_object(handle)) {}
+            impl_(scheduler.make_io_handle(handle)) {}
 
         basic_socket(scheduler_type scheduler, const protocol_type& protocol) : basic_socket(std::move(scheduler)) {
             this->open(protocol);
@@ -312,7 +312,7 @@ namespace coio {
         */
         COIO_ALWAYS_INLINE auto open(const protocol_type& protocol = protocol_type()) -> void {
             if (is_open()) throw std::system_error{error::already_open, "open"};
-            impl_ = get_io_scheduler().make_io_object(detail::to_handle(detail::socket::open(protocol.family(), protocol.type(), protocol.protocol_id())));
+            impl_ = get_io_scheduler().make_io_handle(detail::to_handle(detail::socket::open(protocol.family(), protocol.type(), protocol.protocol_id())));
         }
 
         /**
@@ -665,7 +665,7 @@ namespace coio {
         */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto async_write_some(std::span<const std::byte> buffer) {
-            return this->get_io_scheduler().schedule_io(this->impl_, detail::async_send_t{buffer});
+            return this->get_io_scheduler().schedule_io(this->impl_, detail::async_stream_send_t{buffer});
         }
 
         /**
@@ -794,13 +794,9 @@ namespace coio {
         */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto async_send(std::span<const std::byte> buffer) {
-            // Datagram send completes promptly regardless of the peer, so it needs no shutdown
-            // cancellation hook (schedule_io<false>) — unlike a stream write, which can block on a
-            // full send buffer and stays stoppable.
-            return this->get_io_scheduler().template schedule_io<false>(
-                this->impl_,
-                detail::async_send_t{buffer}
-            );
+            // Datagram send is prompt and atomic, so async_datagram_send_t declares itself unstoppable and
+            // schedule_io skips the shutdown cancellation hook — the type carries the policy, not the call.
+            return this->get_io_scheduler().schedule_io(this->impl_, detail::async_datagram_send_t{buffer});
         }
 
         /**
@@ -834,8 +830,8 @@ namespace coio {
          */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto async_send_to(std::span<const std::byte> buffer, const endpoint& peer) {
-            // Datagram send completes promptly regardless of the peer -> no shutdown hook needed.
-            return this->get_io_scheduler().template schedule_io<false>(
+            // async_send_to_t declares itself unstoppable (prompt datagram) -> schedule_io skips the hook.
+            return this->get_io_scheduler().schedule_io(
                 this->impl_,
                 detail::async_send_to_t{buffer, peer}
             );

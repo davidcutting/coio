@@ -46,7 +46,7 @@ namespace coio {
         public:
             using scheduler_concept = detail::io_scheduler_tag;
 
-            class io_object {
+            class io_handle {
                 friend scheduler;
             private:
                 struct handle_wrapper {
@@ -64,30 +64,30 @@ namespace coio {
                 };
 
             public:
-                io_object(iocp_context& ctx, ::HANDLE handle);
+                io_handle(iocp_context& ctx, ::HANDLE handle);
 
-                io_object(const io_object&) = delete;
+                io_handle(const io_handle&) = delete;
 
-                io_object(io_object&& other) noexcept :
+                io_handle(io_handle&& other) noexcept :
                     ctx_(other.ctx_),
                     handle_(std::exchange(other.handle_, INVALID_HANDLE_VALUE)),
                     offset_(std::exchange(other.offset_, 0))
                 {}
 
-                ~io_object();
+                ~io_handle();
 
-                auto operator= (io_object other) noexcept -> io_object& {
+                auto operator= (io_handle other) noexcept -> io_handle& {
                     swap(other);
                     return *this;
                 }
 
-                auto swap(io_object& other) noexcept -> void {
+                auto swap(io_handle& other) noexcept -> void {
                     std::ranges::swap(ctx_, other.ctx_);
                     std::ranges::swap(handle_, other.handle_);
                     std::ranges::swap(offset_, other.offset_);
                 }
 
-                friend auto swap(io_object& lhs, io_object& rhs) noexcept -> void {
+                friend auto swap(io_handle& lhs, io_handle& rhs) noexcept -> void {
                     lhs.swap(rhs);
                 }
 
@@ -120,10 +120,10 @@ namespace coio {
                 std::size_t offset_ = 0; // for `stream_file`
             };
 
-            // Stoppable=false marks the op as needing no cancellation (datagram send): the op-state
-            // declares coio_unstoppable so operation_state skips the stop-callback, and schedule_io skips
+            // Cancellation need is deduced from the description (detail::is_unstoppable): a datagram send
+            // declares `unstoppable = true`, so the op-state sets coio_unstoppable and schedule_io skips
             // stop_when. See uring_scheduler::schedule_io.
-            template<std::move_constructible Sexpr, bool Stoppable = true>
+            template<std::move_constructible Sexpr>
             struct io_sender {
                 using sender_concept = execution::sender_tag;
                 using completion_signatures = execution::completion_signatures<
@@ -134,7 +134,7 @@ namespace coio {
 
                 template<typename Rcvr>
                 struct state_base : detail::iocp_state_base_for<Sexpr> {
-                    static constexpr bool coio_unstoppable = not Stoppable;
+                    static constexpr bool coio_unstoppable = detail::is_unstoppable<Sexpr>;
 
                     using base = detail::iocp_state_base_for<Sexpr>;
 
@@ -181,17 +181,17 @@ namespace coio {
             using scheduler_base::scheduler_base;
 
             [[nodiscard]]
-            COIO_ALWAYS_INLINE auto make_io_object(::HANDLE handle) const -> io_object {
-                return io_object{*ctx_, handle};
+            COIO_ALWAYS_INLINE auto make_io_handle(::HANDLE handle) const -> io_handle {
+                return io_handle{*ctx_, handle};
             }
 
             [[nodiscard]]
-            COIO_ALWAYS_INLINE auto make_io_object(detail::socket_native_handle_type sock) const -> io_object {
-                return io_object{*ctx_, std::bit_cast<::HANDLE>(sock)};
+            COIO_ALWAYS_INLINE auto make_io_handle(detail::socket_native_handle_type sock) const -> io_handle {
+                return io_handle{*ctx_, std::bit_cast<::HANDLE>(sock)};
             }
 
             template<typename Sexpr>
-            COIO_ALWAYS_INLINE static auto transform_sexpr(io_object& obj, Sexpr sexpr) noexcept {
+            COIO_ALWAYS_INLINE static auto transform_sexpr(io_handle& obj, Sexpr sexpr) noexcept {
                 if constexpr (not std::same_as<Sexpr, detail::async_read_some_t> and not std::same_as<Sexpr, detail::async_write_some_t>) {
                     return std::move(sexpr);
                 }
@@ -208,19 +208,20 @@ namespace coio {
                 }
             }
 
-            // Stoppable=false skips the per-op shutdown stop-hook; see uring_scheduler::schedule_io.
-            // Valid only for ops that complete promptly regardless of the peer (datagram send).
-            template<bool Stoppable = true, typename Sexpr>
+            // An unstoppable description (detail::is_unstoppable — datagram send) skips the per-op shutdown
+            // stop-hook; see uring_scheduler::schedule_io. transform_sexpr is identity for sends, so the
+            // trait survives onto transformed_sexpr_t.
+            template<typename Sexpr>
             [[nodiscard]]
-            COIO_ALWAYS_INLINE auto schedule_io(io_object& obj, Sexpr sexpr) noexcept {
+            COIO_ALWAYS_INLINE auto schedule_io(io_handle& obj, Sexpr sexpr) noexcept {
                 using transformed_sexpr_t = decltype(transform_sexpr(obj, std::move(sexpr)));
-                io_sender<transformed_sexpr_t, Stoppable> sender{
+                io_sender<transformed_sexpr_t> sender{
                     obj.handle_,
                     ctx_,
                     transform_sexpr(obj, std::move(sexpr))
                 };
-                if constexpr (Stoppable) return stop_when(std::move(sender), ctx_->stop_source_.get_token());
-                else return sender;
+                if constexpr (detail::is_unstoppable<transformed_sexpr_t>) return sender;
+                else return stop_when(std::move(sender), ctx_->stop_source_.get_token());
             }
 
             friend auto operator== (const scheduler& lhs, const scheduler& rhs) -> bool = default;
@@ -351,12 +352,18 @@ namespace coio {
         template<>
         auto iocp_state_base_for<async_receive_t>::complete(::DWORD, ::DWORD) noexcept -> void;
 
-        /// async_send
+        /// async_send (stream + datagram share the WSASend impl; separate types so stoppability is deduced)
         template<>
-        auto iocp_state_base_for<async_send_t>::do_start() noexcept -> bool;
+        auto iocp_state_base_for<async_stream_send_t>::do_start() noexcept -> bool;
 
         template<>
-        auto iocp_state_base_for<async_send_t>::complete(::DWORD, ::DWORD) noexcept -> void;
+        auto iocp_state_base_for<async_stream_send_t>::complete(::DWORD, ::DWORD) noexcept -> void;
+
+        template<>
+        auto iocp_state_base_for<async_datagram_send_t>::do_start() noexcept -> bool;
+
+        template<>
+        auto iocp_state_base_for<async_datagram_send_t>::complete(::DWORD, ::DWORD) noexcept -> void;
 
         /// async_receive_from
         template<>

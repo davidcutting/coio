@@ -153,7 +153,7 @@ namespace coio {
         template<io_scheduler IoScheduler>
         class file_base {
         private:
-            using implementation_type = decltype(std::declval<IoScheduler&>().make_io_object(std::declval<typename IoScheduler::native_handle_type>()));
+            using implementation_type = decltype(std::declval<IoScheduler&>().make_io_handle(std::declval<typename IoScheduler::native_handle_type>()));
 
         public:
             // The backend's opaque handle (same one the socket facade uses). Reach the raw fd for the
@@ -164,7 +164,7 @@ namespace coio {
         public:
             explicit file_base(scheduler_type scheduler) noexcept : file_base(std::move(scheduler), native_handle_type{}) {}
 
-            file_base(scheduler_type scheduler, native_handle_type handle) : impl_(scheduler.make_io_object(handle)) {}
+            file_base(scheduler_type scheduler, native_handle_type handle) : impl_(scheduler.make_io_handle(handle)) {}
 
             file_base(const file_base&) = delete;
 
@@ -473,7 +473,7 @@ namespace coio {
          */
         COIO_ALWAYS_INLINE auto open(zstring_view path, detail::open_mode mode) -> void {
             if (this->is_open()) throw std::system_error{error::already_open, "open"};
-            this->impl_ = this->get_io_scheduler().make_io_object(detail::to_handle(detail::open_file(path, mode, false)));
+            this->impl_ = this->get_io_scheduler().make_io_handle(detail::to_handle(detail::open_file(path, mode, false)));
         }
 
         /**
@@ -600,7 +600,7 @@ namespace coio {
          */
         COIO_ALWAYS_INLINE auto open(zstring_view path, detail::open_mode mode) -> void {
             if (this->is_open()) throw std::system_error{error::already_open, "open"};
-            this->impl_ = this->get_io_scheduler().make_io_object(detail::to_handle(detail::open_file(path, mode, true)));
+            this->impl_ = this->get_io_scheduler().make_io_handle(detail::to_handle(detail::open_file(path, mode, true)));
         }
 
         /**

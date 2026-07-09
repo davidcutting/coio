@@ -236,7 +236,12 @@ namespace coio {
         template<> auto uring_state_base_for<async_receive_t>::prepare(::io_uring_sqe* sqe) noexcept -> void {
             ::io_uring_prep_recv(sqe, fd, buffer.data(), buffer.size(), 0);
         }
-        template<> auto uring_state_base_for<async_send_t>::prepare(::io_uring_sqe* sqe) noexcept -> void {
+        // Stream and datagram send share the wire op (prep_send); they are separate descriptions so that
+        // stoppability is deduced from the type (datagram = unstoppable). Identical bodies today.
+        template<> auto uring_state_base_for<async_stream_send_t>::prepare(::io_uring_sqe* sqe) noexcept -> void {
+            ::io_uring_prep_send(sqe, fd, buffer.data(), buffer.size(), MSG_NOSIGNAL);
+        }
+        template<> auto uring_state_base_for<async_datagram_send_t>::prepare(::io_uring_sqe* sqe) noexcept -> void {
             ::io_uring_prep_send(sqe, fd, buffer.data(), buffer.size(), MSG_NOSIGNAL);
         }
         template<> auto uring_state_base_for<async_receive_from_t>::prepare(::io_uring_sqe* sqe) noexcept -> void {

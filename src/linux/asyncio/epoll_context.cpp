@@ -192,7 +192,7 @@ namespace coio {
         return registered_op != nullptr;
     }
 
-    // io_object teardown: deregister both slots, hand the ops back for the caller to post (as stopped).
+    // io_handle teardown: deregister both slots, hand the ops back for the caller to post (as stopped).
     auto epoll_driver::cancel_all(per_fd_data* data) -> std::array<operation*, 2> {
         if (data == nullptr) return {nullptr, nullptr};
         std::scoped_lock _{data->fd_lock};
@@ -250,7 +250,9 @@ namespace coio {
             return true;
         }
 
-        template<> auto epoll_state_base_for<async_send_t>::do_start() noexcept -> bool {
+        // Stream and datagram send share the epoll readiness path (::send); they are separate descriptions
+        // only so stoppability is deduced from the type. Identical bodies today.
+        template<> auto epoll_state_base_for<async_stream_send_t>::do_start() noexcept -> bool {
             if (fd == -1) [[unlikely]] { result.set_error(std::make_error_code(std::errc::bad_file_descriptor)); return false; }
             const ::ssize_t n = ::send(fd, buffer.data(), buffer.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
             if (n == -1) {
@@ -259,7 +261,22 @@ namespace coio {
             }
             result.set_value(n); return false;
         }
-        template<> auto epoll_state_base_for<async_send_t>::do_perform() noexcept -> bool {
+        template<> auto epoll_state_base_for<async_stream_send_t>::do_perform() noexcept -> bool {
+            const ::ssize_t n = ::send(fd, buffer.data(), buffer.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (n == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
+            else result.set_value(n);
+            return true;
+        }
+        template<> auto epoll_state_base_for<async_datagram_send_t>::do_start() noexcept -> bool {
+            if (fd == -1) [[unlikely]] { result.set_error(std::make_error_code(std::errc::bad_file_descriptor)); return false; }
+            const ::ssize_t n = ::send(fd, buffer.data(), buffer.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (n == -1) {
+                if (is_blocking_errno(errno)) { if (not register_event(EPOLLOUT, EPOLLET)) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; } return true; }
+                result.set_error(std::error_code{errno, std::system_category()}); return false;
+            }
+            result.set_value(n); return false;
+        }
+        template<> auto epoll_state_base_for<async_datagram_send_t>::do_perform() noexcept -> bool {
             const ::ssize_t n = ::send(fd, buffer.data(), buffer.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
             if (n == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
             else result.set_value(n);

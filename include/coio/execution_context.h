@@ -193,6 +193,32 @@ namespace coio {
         protected:
             Executor* ctx_;
         };
+
+        // Scheduler composition. A driver may contribute a `scheduler_mixin<Executor, Base>`: a class
+        // template deriving from Base that adds its capability's senders (schedule_after, schedule_io, ...)
+        // on top of whatever surface Base already has. The executor's scheduler is the chain of all
+        // drivers' mixins over executor_scheduler, FIRST driver outermost (most derived) — so when two
+        // drivers provide the same capability, ordinary name hiding makes the first one win, matching
+        // get_driver's first-match rule.
+        template<typename Ex, typename D>
+        concept has_scheduler_mixin = requires { typename D::template scheduler_mixin<Ex, executor_scheduler<Ex>>; };
+
+        template<typename Ex, typename... Ds>
+        struct compose_scheduler {
+            using type = executor_scheduler<Ex>;
+        };
+
+        template<typename Ex, typename D, typename... Rest>
+        struct compose_scheduler<Ex, D, Rest...> {
+            using inner = typename compose_scheduler<Ex, Rest...>::type;
+            static auto pick() {
+                if constexpr (has_scheduler_mixin<Ex, D>)
+                    return std::type_identity<typename D::template scheduler_mixin<Ex, inner>>{};
+                else
+                    return std::type_identity<inner>{};
+            }
+            using type = typename decltype(pick())::type;
+        };
     }
 
     // ============================================================================================
@@ -202,18 +228,11 @@ namespace coio {
     // ============================================================================================
     template<detail::wait_driver WaitDrv, detail::driver... Rest>
     class executor {
-        // The wait-driver contributes its scheduler type if it has one (e.g. uring adds io ops); this is
-        // how uring io stays localized to the uring header while execution_context.h stays liburing-free.
-        template<typename D, typename Ex>
-        static auto pick_scheduler() {
-            if constexpr (requires { typename D::template scheduler_of<Ex>; })
-                return std::type_identity<typename D::template scheduler_of<Ex>>{};
-            else
-                return std::type_identity<detail::executor_scheduler<Ex>>{};
-        }
-
     public:
-        using scheduler = typename decltype(pick_scheduler<WaitDrv, executor>())::type;
+        // The scheduler is composed from the drivers' scheduler_mixins (see compose_scheduler); this is
+        // how backend io stays localized to the backend header while execution_context.h stays
+        // liburing/epoll-free.
+        using scheduler = typename detail::compose_scheduler<executor, WaitDrv, Rest...>::type;
         template<typename T = void, typename Alloc = void>
         using task = coio::task<T, Alloc, scheduler>;
         using wait_driver_type = WaitDrv;

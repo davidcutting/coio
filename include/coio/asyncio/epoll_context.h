@@ -127,7 +127,9 @@ namespace coio {
 
         // op-facing. Posting the deregistered ops back to the run queue is the CALLER's job (it holds the
         // executor): a cancelling op posts itself via its context_; io_handle teardown posts via its ctx_.
-        auto deregister(int event, operation* op) -> bool;                // drop op's registration; true if it was registered
+        // deregister reads op->registered_event_ itself, UNDER the fd lock — the cancelling thread must
+        // not read it unlocked (it races the owner's register_event; TSan-verified hazard).
+        auto deregister(operation* op) -> bool;                           // drop op's registration; true if it was registered
         auto cancel_all(per_fd_data* data) -> std::array<operation*, 2>;  // io_handle teardown: return the deregistered ops
         auto release_fd(int fd, per_fd_data* data) -> void;               // io_handle release: EPOLL_CTL_DEL
         [[nodiscard]] auto epoll_fd() const noexcept -> int { return epoll_fd_; }
@@ -171,9 +173,10 @@ namespace coio {
 
             // Generic io_sender hooks (uniform across all epoll io ops). try_cancel: deregister the event
             // we registered; true iff we were still registered — the caller then posts us back to finish
-            // as stopped. on_finish: epoll needs no pre-delivery bookkeeping.
+            // as stopped. Runs on the cancelling thread: no unlocked field reads here — deregister checks
+            // registered_event_ under the fd lock. on_finish: epoll needs no pre-delivery bookkeeping.
             auto try_cancel() -> bool {
-                return this->registered_event_ != 0 and this->driver_.deregister(this->registered_event_, this);
+                return this->driver_.deregister(this);
             }
             static auto on_finish() noexcept -> void {}
 
@@ -318,7 +321,7 @@ namespace coio {
                     if (canceled) execution::set_stopped(std::move(rcvr_));
                     else result_.forward_to(std::move(rcvr_));
                 }
-                auto do_cancel() -> void { if (driver_.deregister(EPOLLIN, this)) context_.submit(*this); }
+                auto do_cancel() -> void { if (driver_.deregister(this)) context_.submit(*this); }
                 auto perform() noexcept -> bool override {
                     detail::epoll_drain_timerfd(this->fd);
                     result_.set_value();

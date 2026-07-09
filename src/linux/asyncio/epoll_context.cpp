@@ -180,12 +180,15 @@ namespace coio {
         // leave the events buffered; the next poll() drains them into the executor's run queue
     }
 
-    // Drop op's registration for `event`. Returns whether it was still registered (i.e. hadn't already
-    // completed). Posting the op back to the run queue is the CALLER's job (it holds the executor).
-    auto epoll_driver::deregister(int event, operation* op) -> bool {
+    // Drop op's registration. Returns whether it was still registered (i.e. hadn't already completed).
+    // Posting the op back to the run queue is the CALLER's job (it holds the executor). Called from the
+    // cancelling thread, so registered_event_ is read HERE, under the fd lock — reading it before taking
+    // the lock races the owner's register_event (the slot pointers are the source of truth regardless).
+    auto epoll_driver::deregister(operation* op) -> bool {
         COIO_ASSERT(op != nullptr and op->data != nullptr);
         std::scoped_lock _{op->data->fd_lock};
-        const auto registered_op = event == EPOLLIN
+        if (op->registered_event_ == 0) return false;   // never registered: cancel raced a sync completion
+        const auto registered_op = op->registered_event_ == EPOLLIN
             ? std::exchange(op->data->in_op, nullptr)
             : std::exchange(op->data->out_op, nullptr);
         COIO_ASSERT(registered_op == nullptr or registered_op == op);

@@ -6,6 +6,7 @@
 #include <coio/utils/async_result.h>
 #include <coio/detail/error.h>
 #include <coio/detail/io_descriptions.h>
+#include <coio/detail/io_sender.h>
 #include <coio/utils/zstring_view.h>
 
 namespace coio {
@@ -173,6 +174,8 @@ namespace coio {
         class file_base {
         private:
             using implementation_type = decltype(std::declval<IoScheduler&>().make_io_handle(std::declval<typename IoScheduler::native_handle_type>()));
+            static_assert(detail::io_backend_handle<implementation_type>,
+                          "IoScheduler::make_io_handle must yield a conforming io handle (see detail::io_backend_handle)");
 
         public:
             // The backend's opaque handle (same one the socket facade uses). Reach the raw fd for the

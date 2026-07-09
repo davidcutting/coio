@@ -1,4 +1,5 @@
 #pragma once
+#include <concepts>
 #include <system_error>
 #include <utility>
 #include <coio/execution_context.h>
@@ -9,6 +10,30 @@
 namespace coio::detail {
     template<typename Executor>
     using io_driver_of_t = std::remove_reference_t<decltype(std::declval<Executor&>().template get_driver<capability::io>())>;
+
+    // The contract a backend's io_handle owes the facades (socket/file/pipe hold one as their impl_):
+    // move-only ownership of a registration, the opaque-handle accessors, and best-effort teardown via
+    // cancel(). The facades static_assert this against make_io_handle's result, so a new backend gets a
+    // checklist instead of archaeology.
+    //
+    // Deliberately NOT part of the contract:
+    //   - ref() — the op-facing borrow is a private detail between the handle and its own scheduler's
+    //     schedule_io; nothing generic touches it.
+    //   - the teardown DISCIPLINE. Each backend's is dictated by its kernel primitive and does not
+    //     generalize: epoll pull-cancels registered ops and defers the shared per_fd_data free to the
+    //     owner thread; uring routes the cancel to the single-issuer ring, gated on its inflight count;
+    //     iocp fires a thread-safe CancelIoEx and lets aborted packets drain through the port. Unifying
+    //     these was considered and rejected once all three existed — the shared skeleton would be the
+    //     union of three special cases. See each io_handle for its own correctness argument.
+    template<typename Handle>
+    concept io_backend_handle =
+        std::movable<Handle> and not std::copyable<Handle> and
+        requires (Handle& handle, const Handle& chandle) {
+            { chandle.native_handle() } noexcept -> std::same_as<native_handle>;
+            { chandle.get_io_scheduler() } noexcept -> execution::scheduler;
+            { handle.release() } -> std::same_as<native_handle>;
+            handle.cancel();
+        };
 
     // The one io sender shape shared by every backend. The driver contributes, per capability::io:
     //   io_ref            — what one in-flight op needs to target a registration (a non-owning borrow of

@@ -114,12 +114,21 @@ jobs:
         shell: bash
         run: echo "build-output-dir=${{ github.workspace }}/build" >> "$GITHUB_OUTPUT"
 
-      # The io_uring backend needs liburing headers to compile (uring_context.h #errors without them).
-      # ubuntu-latest is 24.04 (liburing 2.5). If a newer symbol (io_uring_register_sync_msg, ~2.6) is
-      # missing, that surfaces here as an undeclared-identifier in wake_up().
-      - name: Install Linux dependencies
+      # The io_uring backend needs liburing to compile, and a recent one: wake_up() calls
+      # io_uring_register_sync_msg (added in liburing 2.6), which ubuntu-latest's apt package (2.5) lacks.
+      # Build a PINNED tag from source (matches the local nix toolchain, 2.14) so the version is
+      # reproducible and definitely carries every symbol coio uses (buf_ring/multishot/register_sync_msg).
+      - name: Build & install liburing (pinned)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y liburing-dev
+        env:
+          LIBURING_TAG: liburing-2.14
+        run: |
+          git clone --depth 1 --branch "$LIBURING_TAG" https://github.com/axboe/liburing.git /tmp/liburing
+          cd /tmp/liburing
+          ./configure
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
 
       - name: Configure CMake
         run: >

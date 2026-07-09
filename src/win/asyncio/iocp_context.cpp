@@ -6,6 +6,7 @@
 #include <MSWSock.h>
 #include <Windows.h>
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <coio/asyncio/iocp_context.h>
 #include <coio/asyncio/file.h>

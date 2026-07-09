@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include <bit>
 #include <filesystem>
 #include <utility>
 #include <coio/core.h>
@@ -17,6 +18,19 @@ namespace coio {
         using file_native_handle_type = void*;
 
         inline const file_native_handle_type invalid_file_handle = reinterpret_cast<void*>(std::uintptr_t(-1)); // NOLINT(*-misplaced-const)
+        // Bridge between the file layer's raw handle (void* HANDLE on Windows, int fd elsewhere) and the
+        // opaque-handle codec's native_fd currency (net/basic.h). On POSIX the two coincide; on Windows
+        // the HANDLE bits ride the codec unchanged (INVALID_HANDLE_VALUE <-> the empty handle: all-ones).
+        [[nodiscard]] inline auto to_handle(file_native_handle_type handle) noexcept -> native_handle {
+            return to_handle(std::bit_cast<native_fd>(handle));
+        }
+        [[nodiscard]] inline auto to_native_file(native_handle handle) noexcept -> file_native_handle_type {
+            return std::bit_cast<file_native_handle_type>(to_native(handle));
+        }
+#else
+        [[nodiscard]] constexpr auto to_native_file(native_handle handle) noexcept -> file_native_handle_type {
+            return to_native(handle);
+        }
 #endif
         /**
          * \brief File open mode flags.
@@ -195,7 +209,7 @@ namespace coio {
              * \throw std::system_error on failure.
              */
             COIO_ALWAYS_INLINE auto close() -> void {
-                close_file(detail::to_native(release()));
+                close_file(detail::to_native_file(release()));
             }
 
             /**
@@ -274,7 +288,7 @@ namespace coio {
                     return this->impl_.file_read(buffer);
                 }
                 else {
-                    return detail::file_read(detail::to_native(this->native_handle()), buffer);
+                    return detail::file_read(detail::to_native_file(this->native_handle()), buffer);
                 }
             }
 
@@ -317,7 +331,7 @@ namespace coio {
                     return this->impl_.file_write(buffer);
                 }
                 else {
-                    return detail::file_write(detail::to_native(this->native_handle()), buffer);
+                    return detail::file_write(detail::to_native_file(this->native_handle()), buffer);
                 }
             }
 
@@ -351,7 +365,7 @@ namespace coio {
              * \throw std::system_error on failure.
              */
             COIO_ALWAYS_INLINE auto read_some_at(std::size_t offset, std::span<std::byte> buffer) -> std::size_t {
-                return detail::file_read_at(detail::to_native(this->native_handle()), offset, buffer);
+                return detail::file_read_at(detail::to_native_file(this->native_handle()), offset, buffer);
             }
 
             /**
@@ -396,7 +410,7 @@ namespace coio {
              * \throw std::system_error on failure.
              */
             COIO_ALWAYS_INLINE auto write_some_at(std::size_t offset, std::span<const std::byte> buffer) -> std::size_t {
-                return detail::file_write_at(detail::to_native(this->native_handle()), offset, buffer);
+                return detail::file_write_at(detail::to_native_file(this->native_handle()), offset, buffer);
             }
 
             /**
@@ -486,7 +500,7 @@ namespace coio {
                 return this->impl_.file_resize(new_size);
             }
             else {
-                return detail::file_resize(detail::to_native(this->native_handle()), new_size);
+                return detail::file_resize(detail::to_native_file(this->native_handle()), new_size);
             }
         }
 
@@ -497,7 +511,7 @@ namespace coio {
          */
         [[nodiscard]]
         COIO_ALWAYS_INLINE  auto size() const -> std::size_t {
-            return detail::file_size(detail::to_native(this->native_handle()));
+            return detail::file_size(detail::to_native_file(this->native_handle()));
         }
 
         /**
@@ -515,7 +529,7 @@ namespace coio {
                 return this->impl_.file_seek(offset, whence);
             }
             else {
-                return detail::file_seek(detail::to_native(this->native_handle()), offset, whence);
+                return detail::file_seek(detail::to_native_file(this->native_handle()), offset, whence);
             }
         }
 
@@ -527,7 +541,7 @@ namespace coio {
          * \throw std::system_error on failure.
          */
         COIO_ALWAYS_INLINE auto sync_all() -> void {
-            detail::file_sync_all(detail::to_native(this->native_handle()));
+            detail::file_sync_all(detail::to_native_file(this->native_handle()));
         }
 
         /**
@@ -538,7 +552,7 @@ namespace coio {
          * \throw std::system_error on failure.
          */
         COIO_ALWAYS_INLINE auto sync_data() -> void {
-            detail::file_sync_data(detail::to_native(this->native_handle()));
+            detail::file_sync_data(detail::to_native_file(this->native_handle()));
         }
     };
 
@@ -613,7 +627,7 @@ namespace coio {
                 return this->impl_.file_resize(new_size);
             }
             else {
-                return detail::file_resize(detail::to_native(this->native_handle()), new_size);
+                return detail::file_resize(detail::to_native_file(this->native_handle()), new_size);
             }
         }
 
@@ -624,7 +638,7 @@ namespace coio {
          */
         [[nodiscard]]
         COIO_ALWAYS_INLINE  auto size() const -> std::size_t {
-            return detail::file_size(detail::to_native(this->native_handle()));
+            return detail::file_size(detail::to_native_file(this->native_handle()));
         }
 
         /**
@@ -635,7 +649,7 @@ namespace coio {
          * \throw std::system_error on failure.
          */
         COIO_ALWAYS_INLINE auto sync_all() -> void {
-            detail::file_sync_all(detail::to_native(this->native_handle()));
+            detail::file_sync_all(detail::to_native_file(this->native_handle()));
         }
 
         /**
@@ -646,7 +660,7 @@ namespace coio {
          * \throw std::system_error on failure.
          */
         COIO_ALWAYS_INLINE auto sync_data() -> void {
-            detail::file_sync_data(detail::to_native(this->native_handle()));
+            detail::file_sync_data(detail::to_native_file(this->native_handle()));
         }
     };
 }

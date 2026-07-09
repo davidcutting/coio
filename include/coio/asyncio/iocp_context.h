@@ -10,10 +10,13 @@
 #include <WinSock2.h>
 #include <bit>
 #include <chrono>
+#include <concepts>
 #include <cstddef>
 #include <memory_resource>
 #include <mutex>
+#include <ranges>
 #include <span>
+#include <type_traits>
 #include <utility>
 #include <coio/execution_context.h>
 #include <coio/time_loop.h>

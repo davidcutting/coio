@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 #include <coio/execution_context.h>
+#include <coio/metrics.h>           // executor_stats (runtime-level aggregation)
 #include <coio/detail/operation_base.h>
 #include <coio/detail/frame_pool.h>
 #include <coio/utils/async_scope.h>
@@ -124,6 +125,12 @@ namespace coio {
         };
 
     public:
+        // Convenience: a pool of `count` default-constructed workers (e.g. basic_runtime<epoll_context>{4}).
+        // For workers needing ctor args, use the factory overload below.
+        explicit basic_runtime(std::size_t count = default_worker_count())
+            requires std::default_initializable<Worker>
+            : basic_runtime(count, [](std::size_t) { return std::make_unique<Worker>(); }) {}
+
         template<std::invocable<std::size_t> Factory, thread_launcher Launcher = default_thread_launcher>
             requires std::convertible_to<std::invoke_result_t<Factory&, std::size_t>, std::unique_ptr<Worker>>
         basic_runtime(std::size_t count, Factory make_worker, Launcher launch = {}) {
@@ -173,10 +180,40 @@ namespace coio {
             return scheduler{this};
         }
 
+        // ---- runtime-level metrics: only when Worker carries a snapshotting policy ----
+        // e.g. basic_runtime<basic_executor<counting_metrics, epoll_driver>>. A default (no_metrics) worker
+        // simply doesn't offer these, so an unmetered runtime stays zero-cost.
+
+        // One snapshot per worker (size() entries, worker order).
+        [[nodiscard]] auto collect_metrics() const -> std::vector<executor_stats>
+            requires requires(const Worker& w) { { w.metrics().snapshot() } -> std::convertible_to<executor_stats>; } {
+            std::vector<executor_stats> out;
+            out.reserve(workers_.size());
+            for (auto& w : workers_) out.push_back(w->metrics().snapshot());
+            return out;
+        }
+
+        // Whole-runtime totals: the per-worker snapshots summed field-wise.
+        [[nodiscard]] auto aggregate_metrics() const -> executor_stats
+            requires requires(const Worker& w) { { w.metrics().snapshot() } -> std::convertible_to<executor_stats>; } {
+            executor_stats total{};
+            for (const auto& s : collect_metrics()) total = total + s;
+            return total;
+        }
+
         [[nodiscard]]
         static auto current_scheduler() noexcept -> std::optional<worker_scheduler> {
             if (auto* w = current_worker_) return w->get_scheduler();
             return std::nullopt;
+        }
+
+        // Round-robin one worker's own scheduler — for pinning CONTEXT-AFFINE work to a specific worker
+        // (e.g. accept a connection onto worker i, then handle it there). Distinct from get_scheduler()
+        // (the runtime placement scheduler, which round-robins bare ops) and from capability routing:
+        // this hands back a concrete worker so you can bind an io_object to it and keep it there.
+        [[nodiscard]] auto pick_scheduler() noexcept -> worker_scheduler {
+            const auto i = pick_cursor_.fetch_add(1, std::memory_order_relaxed) % workers_.size();
+            return workers_[i]->get_scheduler();
         }
 
         auto spawn(execution::sender auto sndr) -> void {
@@ -230,6 +267,7 @@ namespace coio {
         std::vector<work_guard<Worker>> guards_;
         std::vector<std::jthread> threads_;
         std::atomic<std::size_t> wake_cursor_{0};
+        std::atomic<std::size_t> pick_cursor_{0};
         async_scope scope_;
         std::atomic<bool> stopped_{false};
         std::atomic<bool> joined_{false};

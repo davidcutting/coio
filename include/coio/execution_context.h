@@ -226,19 +226,25 @@ namespace coio {
     // FIRST driver is the wait-owner (blocks/wakes the thread). Single-owner: exactly one thread ever
     // calls run()/run_once(); cross-thread work arrives via the lock-free inject stack.
     // ============================================================================================
-    template<detail::wait_driver WaitDrv, detail::driver... Rest>
-    class executor {
+    // The Metrics policy observes the run loop (turns, park/unpark, wakes, submits). no_metrics (the
+    // default via the `executor` alias below) has empty inline hooks + is an empty [[no_unique_address]]
+    // member -> zero cost, zero size. A real sink (coio::counting_metrics, or your own) plugs in as
+    // basic_executor<M, Drivers...>. Owner-thread hooks are called single-threaded (cheap relaxed
+    // load+store in a sink); woke()/submitted_remote() may be called cross-thread (need atomic RMW).
+    template<typename Metrics, detail::wait_driver WaitDrv, detail::driver... Rest>
+    class basic_executor {
     public:
         // The scheduler is composed from the drivers' scheduler_mixins (see compose_scheduler); this is
         // how backend io stays localized to the backend header while execution_context.h stays
         // liburing/epoll-free.
-        using scheduler = typename detail::compose_scheduler<executor, WaitDrv, Rest...>::type;
+        using scheduler = typename detail::compose_scheduler<basic_executor, WaitDrv, Rest...>::type;
         template<typename T = void, typename Alloc = void>
         using task = coio::task<T, Alloc, scheduler>;
         using wait_driver_type = WaitDrv;
+        using metrics_type = Metrics;
 
-        executor() = default;
-        explicit executor(std::pmr::memory_resource& mr) noexcept : allocator_(&mr) {}
+        basic_executor() = default;
+        explicit basic_executor(std::pmr::memory_resource& mr) noexcept : allocator_(&mr) {}
 
         // Construct the (sole) wait-driver in-place from Args. Drivers own kernel resources and are
         // non-movable, so they're built in the tuple, not passed by value. tuple's element-wise ctor
@@ -247,7 +253,7 @@ namespace coio {
         // multi-driver executor with per-driver ctor args would need a richer builder.)
         template<typename... Args>
             requires (sizeof...(Rest) == 0) and std::constructible_from<WaitDrv, Args&&...>
-        explicit executor(std::in_place_t, Args&&... args)
+        explicit basic_executor(std::in_place_t, Args&&... args)
             : drivers_(std::forward<Args>(args)...) {}
 
         // Build EACH driver in place from its coio::driver_init spec — the multi-driver construction path.
@@ -259,10 +265,10 @@ namespace coio {
         template<typename... Specs>
             requires (sizeof...(Specs) == 1 + sizeof...(Rest))
                 and std::constructible_from<std::tuple<WaitDrv, Rest...>, Specs...>
-        explicit executor(Specs... specs) : drivers_(std::move(specs)...) {}
+        explicit basic_executor(Specs... specs) : drivers_(std::move(specs)...) {}
 
-        executor(const executor&) = delete;
-        auto operator= (const executor&) -> executor& = delete;
+        basic_executor(const basic_executor&) = delete;
+        auto operator= (const basic_executor&) -> basic_executor& = delete;
 
         template<typename Cap>
         static constexpr bool has_capability =
@@ -281,15 +287,17 @@ namespace coio {
         // inject stack, waking us iff we made it non-empty (and we are parked).
         COIO_ALWAYS_INLINE auto submit(detail::operation_base& op) -> void {
             if (owner_.load(std::memory_order_relaxed) == std::this_thread::get_id()) {
+                metrics_.submitted_local();      // owner fast-path (single-writer)
                 ready_.push_back(op);
                 return;
             }
+            metrics_.submitted_remote();         // cross-thread post (any thread)
             if (inject_stack_.push(op) != detail::stack_status::not_empty) wake_up();
         }
 
         COIO_ALWAYS_INLINE auto wake_up() noexcept -> void {
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            if (parked_.load(std::memory_order_relaxed)) wait_driver().wake_up();
+            if (parked_.load(std::memory_order_relaxed)) { wait_driver().wake_up(); metrics_.woke(); }
         }
 
         // Relaxed RMW: the counter is only a "should I consider exiting" gate, re-validated under the park
@@ -313,20 +321,26 @@ namespace coio {
             return work_count_.load(std::memory_order_relaxed);
         }
 
+        // The run-loop metrics policy for this executor (read stats via metrics().snapshot() for sinks that
+        // provide it, e.g. coio::counting_metrics). With no_metrics this is an empty object.
+        [[nodiscard]] COIO_ALWAYS_INLINE auto metrics() noexcept -> Metrics& { return metrics_; }
+        [[nodiscard]] COIO_ALWAYS_INLINE auto metrics() const noexcept -> const Metrics& { return metrics_; }
+
         // One non-blocking pass: claim ownership, drain posts, poll every driver, run up to `batch`
         // ready continuations. Returns whether it did any work. Never blocks.
         auto run_once() -> bool {
             owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
             drain_inbox();
             std::apply([&](auto&... d) { (d.poll(ready_, batch_), ...); }, drivers_);
-            bool did_work = false;
-            for (std::size_t i = 0; i < batch_; ++i) {
+            std::size_t n = 0;
+            for (; n < batch_; ++n) {
                 auto* op = ready_.pop_front();
                 if (op == nullptr) break;
                 op->finish();
-                did_work = true;
             }
-            return did_work;
+            metrics_.ran(n);
+            metrics_.turn();
+            return n != 0;
         }
 
         auto run() -> std::size_t {
@@ -351,7 +365,9 @@ namespace coio {
                 parked_.store(true, std::memory_order_relaxed);
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (not inject_stack_.empty()) { parked_.store(false, std::memory_order_relaxed); continue; }
+                metrics_.parked();
                 wait_driver().poll_wait();
+                metrics_.unparked();
                 parked_.store(false, std::memory_order_relaxed);
             }
             return turns;
@@ -394,7 +410,26 @@ namespace coio {
         std::atomic<bool> parked_{false};
         std::atomic<std::size_t> work_count_{0};
         std::size_t batch_ = 64;
+        [[no_unique_address]] Metrics metrics_{};   // no_metrics -> zero size, empty inline hooks
     };
+
+    // The run-loop metrics policy default: every hook is a no-op, so the executor pays nothing (empty
+    // [[no_unique_address]] member, inlined-away calls). Plug a real sink via basic_executor<M, Drivers...>
+    // — e.g. coio::counting_metrics (see <coio/metrics.h>). Owner-thread hooks (turn/ran/parked/unparked/
+    // submitted_local) are called single-threaded; woke()/submitted_remote() may be called cross-thread.
+    struct no_metrics {
+        COIO_ALWAYS_INLINE void turn() noexcept {}
+        COIO_ALWAYS_INLINE void ran(std::size_t) noexcept {}
+        COIO_ALWAYS_INLINE void parked() noexcept {}
+        COIO_ALWAYS_INLINE void unparked() noexcept {}
+        COIO_ALWAYS_INLINE void woke() noexcept {}
+        COIO_ALWAYS_INLINE void submitted_local() noexcept {}
+        COIO_ALWAYS_INLINE void submitted_remote() noexcept {}
+    };
+
+    // The common spelling: an executor with metrics off. `basic_executor<M, ...>` opts a sink in.
+    template<detail::wait_driver WaitDrv, detail::driver... Rest>
+    using executor = basic_executor<no_metrics, WaitDrv, Rest...>;
 
     template<typename ExecutionContext>
     concept execution_context = requires(ExecutionContext& context) {

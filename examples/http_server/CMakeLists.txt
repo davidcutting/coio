@@ -3,8 +3,6 @@ add_executable(
     connection.h
     connection.cpp
     define.h
-    io_context_pool.h
-    io_context_pool.cpp
     response.h
     response.cpp
     request.h

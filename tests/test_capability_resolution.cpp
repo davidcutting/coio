@@ -16,6 +16,10 @@ static_assert(std::same_as<
               "a driver covering BOTH requested capabilities is chosen");
 static_assert(std::same_as<coio::detail::resolve_t<coio::default_drivers, coio::capability::file>, coio::uring_driver>,
               "regular files resolve to io_uring (the only file-capable backend on this build)");
+// cpu is a ROLE tag claimed only by the lightweight worker driver, so .capability<cpu>() picks it —
+// NOT io_uring, even though io_uring is first in the fast-path registry and can also run CPU work.
+static_assert(std::same_as<coio::detail::resolve_t<coio::default_drivers, coio::capability::cpu>, coio::timer_driver>,
+              "cpu resolves to the lightweight worker driver, not the io_uring reactor");
 // epoll does NOT provide file; an epoll-only registry can't serve files (would be a resolve static_assert).
 static_assert(coio::detail::resolve_index<coio::type_list<coio::epoll_driver, coio::timer_driver>, coio::capability::file>()
                   == coio::type_list<coio::epoll_driver, coio::timer_driver>::npos,
@@ -47,6 +51,20 @@ TEST_CASE("builder .capability<file>(): resolves to io_uring and routes file wor
         coio::this_thread::sync_wait(rt.join());
     }
     CHECK(ok.load() == 4);
+}
+
+TEST_CASE("builder .capability<cpu>(): a lightweight worker (thread) pool") {
+    std::atomic<int> ok{0};
+    {
+        auto rt = coio::runtime::builder()
+            .pool(4).capability<coio::capability::cpu>()   // -> 4x executor<timer_driver>, a thread pool
+            .build();
+        CHECK(rt.size() == 4);
+        for (int i = 0; i < 16; ++i)
+            rt.spawn_on<coio::capability::cpu>(coio::just() | coio::then([&] { ok.fetch_add(1, std::memory_order_relaxed); }));
+        coio::this_thread::sync_wait(rt.join());
+    }
+    CHECK(ok.load() == 16);
 }
 
 TEST_CASE("builder: capability and explicit driver pools coexist in one runtime") {

@@ -13,6 +13,10 @@ namespace coio::capability {
     struct timer {}; // timed scheduling: schedule_at / schedule_after
     struct io {};    // sockets/pipes: the pollable io-op family (read/write/recv/send/accept/...)
     struct file {};  // REGULAR files: not pollable, so epoll can't serve them — io_uring/IOCP only
+    // A ROLE tag, not an op-family: "a dedicated reactor-less worker" (park/wake + run posted work). Only
+    // the lightweight worker driver claims it, so .capability<cpu>() resolves to that — NOT to a heavy
+    // io_uring/epoll reactor (which can run CPU work via plain placement, but shouldn't be *chosen* for it).
+    struct cpu {};
 }
 
 namespace coio::detail {

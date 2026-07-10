@@ -15,12 +15,15 @@ namespace coio {
     template<typename Executor, typename Base = detail::executor_scheduler<Executor>>
     class timer_scheduler;
 
-    // A single-owner timer wait-owner: no ring, just a deadline heap + a semaphore to sleep on. This is
-    // what `time_loop` (the old multi-owner timer/CPU context, now single-owner) is built from. schedule()
-    // placement continuations run via the executor; schedule_after() posts a timer op here.
+    // The userspace run-loop worker: no kernel reactor, just a semaphore to park on + a deadline heap.
+    // Its primary role is being a reactor-less CPU worker (park/wake + run posted work — hence
+    // capability::cpu); timers are the one op-family it adds on top (capability::timer). `time_loop` =
+    // executor<timer_driver>. schedule() placement runs via the executor; schedule_after() posts a timer here.
     class timer_driver {
     public:
-        using capabilities = type_list<capability::timer>;
+        // cpu = "a dedicated reactor-less worker" (see capability::cpu — only this driver claims it, so
+        // .capability<cpu>() picks it, not a heavy io_uring/epoll reactor). timer = timed scheduling.
+        using capabilities = type_list<capability::cpu, capability::timer>;
         // The scheduler fragment this driver contributes (see detail::compose_scheduler): timed
         // scheduling (now/schedule_at/schedule_after) layered onto whatever surface Base already has.
         template<typename Executor, typename Base>

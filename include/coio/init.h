@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 #include <coio/execution_context.h>
+#include <coio/metrics.h>           // executor_stats, snapshotting_metrics (runtime-level aggregation)
 #include <coio/runtime.h>            // thread_launcher, default_thread_launcher, work_guard
 #include <coio/detail/driver.h>      // driver / wait_driver concepts, capability tags
 #include <coio/detail/frame_pool.h>
@@ -125,7 +126,7 @@ namespace coio {
     template<typename... Specs>
         requires (sizeof...(Specs) >= 1) and (detail::is_driver_spec<Specs> and ...)
     [[nodiscard]] auto pool(std::size_t count, Specs... specs) {
-        using Ex = executor<typename Specs::driver_type...>;
+        using Ex = basic_executor<no_metrics, typename Specs::driver_type...>;   // alias can't take a pack expansion; name the class
         return pool_spec<Ex, Specs...>{count == 0 ? 1 : count, std::tuple<Specs...>(std::move(specs)...)};
     }
 
@@ -210,6 +211,29 @@ namespace coio {
         [[nodiscard]] auto size() const noexcept -> std::size_t {
             std::size_t total = 0;
             std::apply([&](const auto&... p) { ((total += p.workers.size()), ...); }, pools_);
+            return total;
+        }
+
+        // ---- runtime-level metrics (only when every pool's executor carries a snapshotting policy) ----
+        // These compile only for a metered runtime — builder().metrics<counting_metrics>()... — so a default
+        // (no_metrics) runtime stays zero-cost and simply doesn't offer them.
+
+        // One snapshot per worker, in pool-then-worker order (size() entries).
+        [[nodiscard]] auto collect_metrics() const -> std::vector<executor_stats>
+            requires (snapshotting_metrics<typename PoolSpecs::executor_type::metrics_type> and ...) {
+            std::vector<executor_stats> out;
+            out.reserve(size());
+            std::apply([&](const auto&... p) {
+                (([&] { for (auto& w : p.workers) out.push_back(w->metrics().snapshot()); }()), ...);
+            }, pools_);
+            return out;
+        }
+
+        // Whole-runtime totals: the per-worker snapshots summed field-wise.
+        [[nodiscard]] auto aggregate_metrics() const -> executor_stats
+            requires (snapshotting_metrics<typename PoolSpecs::executor_type::metrics_type> and ...) {
+            executor_stats total{};
+            for (const auto& s : collect_metrics()) total = total + s;
             return total;
         }
 
@@ -307,11 +331,11 @@ namespace coio {
 
     namespace detail {
         // Turn an in-progress pool (count + its accumulated driver specs) into a finished pool_spec whose
-        // executor type is deduced from the drivers.
-        template<typename... Specs>
+        // executor type is deduced from the drivers, metered with the builder's Metrics policy.
+        template<typename Metrics, typename... Specs>
         [[nodiscard]] auto make_pool_spec(std::size_t count, std::tuple<Specs...> drivers) {
             static_assert(sizeof...(Specs) >= 1, "each pool needs at least one .driver<D>()");
-            using Ex = executor<typename Specs::driver_type...>;
+            using Ex = basic_executor<Metrics, typename Specs::driver_type...>;   // alias can't take a pack expansion; name the class
             return pool_spec<Ex, Specs...>{count == 0 ? 1 : count, std::move(drivers)};
         }
     }
@@ -327,9 +351,10 @@ namespace coio {
     // HasCurrent tracks (at the type level) whether a pool is open, so .driver<> before .pool() and an
     // empty .build() are compile errors. CurrentDrivers is the open pool's driver_spec tuple; DonePools is
     // the finished pool_spec tuple.
-    template<bool HasCurrent, typename CurrentDrivers, typename DonePools, typename Registry = detail::no_registry>
+    template<bool HasCurrent, typename CurrentDrivers, typename DonePools,
+             typename Registry = detail::no_registry, typename Metrics = no_metrics>
     class runtime_builder {
-        template<bool, typename, typename, typename> friend class runtime_builder;
+        template<bool, typename, typename, typename, typename> friend class runtime_builder;
 
         std::size_t current_count_ = 0;
         CurrentDrivers current_drivers_{};
@@ -341,15 +366,25 @@ namespace coio {
     public:
         runtime_builder() requires (not HasCurrent) = default;
 
+        // Attach a run-loop metrics policy (e.g. coio::counting_metrics) to EVERY worker this runtime builds,
+        // enabling the runtime's collect_metrics()/aggregate_metrics(). Must precede the first .pool() — it
+        // rebinds the executor type for all pools. Off by default (no_metrics: zero cost, zero size).
+        template<typename M>
+        [[nodiscard]] auto metrics() && {
+            static_assert(not HasCurrent and std::tuple_size_v<DonePools> == 0,
+                "call .metrics<M>() before opening any .pool()");
+            return runtime_builder<false, std::tuple<>, std::tuple<>, Registry, M>{0, {}, {}};
+        }
+
         // Open a new pool of `count` executors, finalising any pool already open.
         [[nodiscard]] auto pool(std::size_t count) && {
             if constexpr (HasCurrent) {
                 auto done = std::tuple_cat(std::move(done_),
-                    std::make_tuple(detail::make_pool_spec(current_count_, std::move(current_drivers_))));
-                return runtime_builder<true, std::tuple<>, decltype(done), Registry>{count, {}, std::move(done)};
+                    std::make_tuple(detail::make_pool_spec<Metrics>(current_count_, std::move(current_drivers_))));
+                return runtime_builder<true, std::tuple<>, decltype(done), Registry, Metrics>{count, {}, std::move(done)};
             }
             else {
-                return runtime_builder<true, std::tuple<>, DonePools, Registry>{count, {}, std::move(done_)};
+                return runtime_builder<true, std::tuple<>, DonePools, Registry, Metrics>{count, {}, std::move(done_)};
             }
         }
 
@@ -360,7 +395,7 @@ namespace coio {
             static_assert(HasCurrent, "call .pool(count) before .driver<D>()");
             auto drivers = std::tuple_cat(std::move(current_drivers_),
                 std::make_tuple(driver_init<D>(std::forward<Args>(args)...)));
-            return runtime_builder<true, decltype(drivers), DonePools, Registry>{
+            return runtime_builder<true, decltype(drivers), DonePools, Registry, Metrics>{
                 current_count_, std::move(drivers), std::move(done_) };
         }
 
@@ -376,7 +411,7 @@ namespace coio {
                 "<coio/drivers.h> (or a registry-parameterised builder), or name the driver with .driver<D>()");
             using D = detail::resolve_t<Registry, Caps...>;
             auto drivers = std::tuple_cat(std::move(current_drivers_), std::make_tuple(driver_init<D>()));
-            return runtime_builder<true, decltype(drivers), DonePools, Registry>{
+            return runtime_builder<true, decltype(drivers), DonePools, Registry, Metrics>{
                 current_count_, std::move(drivers), std::move(done_) };
         }
 
@@ -384,7 +419,7 @@ namespace coio {
         [[nodiscard]] auto build() && {
             static_assert(HasCurrent, "add at least one pool: .pool(count).driver<D>(...) or .capability<...>()");
             auto all = std::tuple_cat(std::move(done_),
-                std::make_tuple(detail::make_pool_spec(current_count_, std::move(current_drivers_))));
+                std::make_tuple(detail::make_pool_spec<Metrics>(current_count_, std::move(current_drivers_))));
             return std::apply([](auto... ps) { return make_runtime(std::move(ps)...); }, std::move(all));
         }
     };

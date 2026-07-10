@@ -23,7 +23,7 @@ namespace {
     auto consumer(udp_socket& rx, coio::buffer_ring& bufs,
                   std::atomic<int>& count, coio::inplace_stop_token tok) -> io_context::task<> {
         co_await coio::stop_when(
-            rx.async_receive_multishot(bufs, [&](std::span<std::byte> dg) noexcept {
+            rx.async_receive_sequence(bufs, [&](std::span<std::byte> dg) noexcept {   // multishot lowering on uring
                 count.fetch_add(1, std::memory_order_relaxed);
                 (void)dg;
             }),

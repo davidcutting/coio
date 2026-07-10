@@ -220,7 +220,7 @@ namespace coio {
         template<> auto epoll_state_base_for<async_read_some_t>::do_perform() noexcept -> bool {
             const ::ssize_t n = ::read(fd, buffer.data(), buffer.size());
             if (n == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
-            else result.set_value(n);
+            else deliver_read_result<async_read_some_t>(result, static_cast<std::size_t>(n), buffer.empty());
             return true;
         }
 
@@ -244,12 +244,30 @@ namespace coio {
                 if (is_blocking_errno(errno)) { if (not register_event(EPOLLIN, EPOLLET)) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; } return true; }
                 result.set_error(std::error_code{errno, std::system_category()}); return false;
             }
-            result.set_value(n); return false;
+            deliver_read_result<async_receive_t>(result, static_cast<std::size_t>(n), buffer.empty()); return false;
         }
         template<> auto epoll_state_base_for<async_receive_t>::do_perform() noexcept -> bool {
             const ::ssize_t n = ::recv(fd, buffer.data(), buffer.size(), MSG_DONTWAIT);
             if (n == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
-            else result.set_value(n);
+            else deliver_read_result<async_receive_t>(result, static_cast<std::size_t>(n), buffer.empty());
+            return true;
+        }
+
+        // Stream (TCP) receive: identical readiness path to async_receive_t, but eof_on_zero folds a 0-byte
+        // recv on a non-empty buffer into error::eof (peer closed). Separate description = the EOF semantic.
+        template<> auto epoll_state_base_for<async_stream_receive_t>::do_start() noexcept -> bool {
+            if (fd == -1) [[unlikely]] { result.set_error(std::make_error_code(std::errc::bad_file_descriptor)); return false; }
+            const ::ssize_t n = ::recv(fd, buffer.data(), buffer.size(), MSG_DONTWAIT);
+            if (n == -1) {
+                if (is_blocking_errno(errno)) { if (not register_event(EPOLLIN, EPOLLET)) [[unlikely]] { result.set_error(std::error_code{errno, std::system_category()}); return false; } return true; }
+                result.set_error(std::error_code{errno, std::system_category()}); return false;
+            }
+            deliver_read_result<async_stream_receive_t>(result, static_cast<std::size_t>(n), buffer.empty()); return false;
+        }
+        template<> auto epoll_state_base_for<async_stream_receive_t>::do_perform() noexcept -> bool {
+            const ::ssize_t n = ::recv(fd, buffer.data(), buffer.size(), MSG_DONTWAIT);
+            if (n == -1) { if (is_blocking_errno(errno)) [[unlikely]] return false; result.set_error(std::error_code{errno, std::system_category()}); }
+            else deliver_read_result<async_stream_receive_t>(result, static_cast<std::size_t>(n), buffer.empty());
             return true;
         }
 

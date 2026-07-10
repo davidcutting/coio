@@ -8,13 +8,17 @@
 #if COIO_HAS_EPOLL
 #include <coio/asyncio/epoll_context.h>      // epoll_driver
 #endif
+#if COIO_HAS_IOCP
+#include <coio/asyncio/iocp_context.h>       // iocp_driver (Windows)
+#endif
 
 // The default driver registry for this build, and the customization-point wiring that lets
 // coio::runtime::builder().pool(n).capability<...>() resolve capabilities to drivers automatically.
-// FAST-PATH FIRST: io_uring leads on a build that has it, so "just give me networking and files" gets the
-// fast path; epoll is the fallback (and can't serve files, so capability<file> on an epoll-only build is a
-// clear compile error); the userspace timer heap is always last. Include this header wherever you use
-// .capability<>(); .driver<>() (explicit backends / bespoke topologies) works from <coio/init.h> alone.
+// FAST-PATH FIRST: the native completion backend leads — io_uring on Linux, IOCP on Windows (both serve
+// io+file) — so "just give me networking and files" gets the fast path; epoll is the Linux fallback (and
+// can't serve files, so capability<file> on an epoll-only build is a clear compile error); the userspace
+// timer heap is always last. Include this header wherever you use .capability<>(); .driver<>() (explicit
+// backends / bespoke topologies) works from <coio/init.h> alone.
 namespace coio {
     using default_drivers = type_list<
 #if COIO_HAS_IO_URING
@@ -22,6 +26,9 @@ namespace coio {
 #endif
 #if COIO_HAS_EPOLL
         epoll_driver,
+#endif
+#if COIO_HAS_IOCP
+        iocp_driver,
 #endif
         timer_driver
     >;

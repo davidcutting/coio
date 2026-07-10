@@ -4,6 +4,9 @@
 #include <coio/core.h>
 #include <coio/drivers.h>
 
+// Hardcodes the Linux driver set (uring/epoll); skip on a build without io_uring (Windows/IOCP, epoll-only).
+#if COIO_HAS_IO_URING
+
 TEST_CASE("runtime::builder fluent builder: 2 uring + 2 epoll, routed spawn, clean teardown") {
     std::atomic<int> ok{0};
     {
@@ -36,3 +39,7 @@ TEST_CASE("runtime::builder: single uring pool, exact-worker-count and capabilit
         CHECK(ran.load() == 1);
     }
 }
+
+#else
+TEST_CASE("runtime builder (skipped: build has no io_uring)") { CHECK(true); }
+#endif

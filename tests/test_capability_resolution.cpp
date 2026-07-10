@@ -5,6 +5,11 @@
 #include <coio/core.h>
 #include <coio/drivers.h>
 
+// This suite asserts the LINUX driver set (io_uring leads, epoll fallback). On a build without io_uring
+// (Windows/IOCP, or an epoll-only Linux build) it compiles to a skip marker — the capability machinery
+// itself is backend-agnostic and exercised via the other runtime tests.
+#if COIO_HAS_IO_URING
+
 // Fast-path-first resolution is a compile-time fact of the build's driver registry.
 static_assert(std::same_as<coio::detail::resolve_t<coio::default_drivers, coio::capability::io>, coio::uring_driver>,
               "networking resolves to io_uring (fast path) on this build");
@@ -83,3 +88,7 @@ TEST_CASE("builder: capability and explicit driver pools coexist in one runtime"
     }
     CHECK(ok.load() == 12);
 }
+
+#else
+TEST_CASE("capability resolution (skipped: build has no io_uring)") { CHECK(true); }
+#endif

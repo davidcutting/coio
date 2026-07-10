@@ -120,6 +120,12 @@ namespace coio {
             if (const auto ec = ::io_uring_enable_rings(&uring_); ec < 0) {
                 throw std::system_error{-ec, std::system_category()};
             }
+            // Register the ring fd for this (owner) thread's io_uring_enter calls, so each submit/wait passes
+            // a registered index instead of the raw fd — skipping the fd->file lookup the kernel does per
+            // enter. Owner-thread + single-issuer, so it's registered exactly where it's used. Best-effort:
+            // older kernels lack it, and the ring works with the raw fd regardless (cross-thread wake still
+            // targets uring_.ring_fd via register_sync_msg — a separate path, unaffected).
+            ::io_uring_register_ring_fd(&uring_);
             owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
             enabled_ = true;
         }
@@ -234,6 +240,9 @@ namespace coio {
             ::io_uring_prep_write(sqe, fd, buffer.data(), buffer.size(), offset);
         }
         template<> auto uring_state_base_for<async_receive_t>::prepare(::io_uring_sqe* sqe) noexcept -> void {
+            ::io_uring_prep_recv(sqe, fd, buffer.data(), buffer.size(), 0);
+        }
+        template<> auto uring_state_base_for<async_stream_receive_t>::prepare(::io_uring_sqe* sqe) noexcept -> void {
             ::io_uring_prep_recv(sqe, fd, buffer.data(), buffer.size(), 0);
         }
         // Stream and datagram send share the wire op (prep_send); they are separate descriptions so that

@@ -18,6 +18,7 @@
 #include <span>
 #include <type_traits>
 #include <utility>
+#include <vector>
 #include <coio/execution_context.h>
 #include <coio/time_loop.h>
 #include <coio/utils/async_result.h>
@@ -93,7 +94,7 @@ namespace coio {
             detail::async_read_some_t, detail::async_write_some_t,
             detail::async_read_some_at_t, detail::async_write_some_at_t,
             detail::async_stream_send_t, detail::async_datagram_send_t,
-            detail::async_receive_t, detail::async_receive_from_t, detail::async_send_to_t,
+            detail::async_receive_t, detail::async_stream_receive_t, detail::async_receive_from_t, detail::async_send_to_t,
             detail::async_accept_t, detail::async_connect_t>;
         template<typename IoOp>
         static constexpr bool supports = supported_io_ops::template contains<IoOp>;
@@ -239,6 +240,12 @@ namespace coio {
         template<>
         auto iocp_state_base_for<async_receive_t>::complete(::DWORD, ::DWORD) noexcept -> void;
 
+        template<>
+        auto iocp_state_base_for<async_stream_receive_t>::do_start() noexcept -> bool;
+
+        template<>
+        auto iocp_state_base_for<async_stream_receive_t>::complete(::DWORD, ::DWORD) noexcept -> void;
+
         /// async_send (stream + datagram share the WSASend impl; separate types so stoppability is deduced)
         template<>
         auto iocp_state_base_for<async_stream_send_t>::do_start() noexcept -> bool;
@@ -281,6 +288,18 @@ namespace coio {
         auto iocp_state_base_for<async_connect_t>::complete(::DWORD, ::DWORD) noexcept -> void;
     }
 
+    // iocp's provided-buffer analog for async_receive_sequence's loop fallback (iocp has no multishot recv):
+    // one reused buffer, same shape as epoll's. Ctor matches uring's buffer_ring (ctx, count, buffer_size,
+    // bgid) so `IoScheduler::buffer_pool bufs{ctx, n, size, bgid}` constructs uniformly; count/bgid ignored.
+    class iocp_buffer_pool {
+    public:
+        iocp_buffer_pool(executor<iocp_driver>& /*ctx*/, unsigned /*count*/, unsigned buffer_size, int /*bgid*/)
+            : storage_(buffer_size) {}
+        [[nodiscard]] auto buffer() noexcept -> std::span<std::byte> { return storage_; }
+    private:
+        std::vector<std::byte> storage_;
+    };
+
     // A scheduler mixin (not a standalone scheduler): adds iocp's io senders on top of Base — which, via
     // iocp_driver::scheduler_mixin, is the shared timer mixin, so timed scheduling is inherited rather
     // than reimplemented. The default Base keeps the plain `iocp_scheduler<Ex>` spelling equal to
@@ -291,6 +310,8 @@ namespace coio {
         using scheduler_concept = detail::io_scheduler_tag;
         // The opaque handle this backend hands out: bits <-> the raw HANDLE/SOCKET (identity codec).
         using native_handle_type = detail::native_handle;
+        // Provided-buffer group for async_receive_sequence's loop fallback (iocp has no multishot recv).
+        using buffer_pool = iocp_buffer_pool;
         using Base::Base;
 
         // Internal, facaded by socket/file (held as their impl_). Registers the handle with the port on

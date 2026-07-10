@@ -432,6 +432,95 @@ namespace coio {
         implementation_type impl_;
     };
 
+    namespace detail {
+        // Generic (backend-neutral) fallback for async_accept_sequence: a coroutine bound to Sched that
+        // re-issues single-shot accept and hands each freshly-minted fd (as a native_handle) to `sink`,
+        // until stopped (unwinds -> set_stopped) or a fatal error (-> set_error). Uses only schedule_io +
+        // async_accept_t, which every backend supports, so epoll/iocp get the "keep accepting" API for
+        // free; io_uring overrides it with multishot accept (uring_scheduler::accept_multishot). Bound to
+        // Sched so the co_awaits affine + propagate the stop token exactly like any task on that scheduler.
+        template<typename Sched, typename Handle, typename HandleSink>
+        auto accept_sequence_loop(Handle& impl, Sched sched, HandleSink sink) -> coio::task<void, void, Sched> {
+            for (;;) {
+                auto handle = co_await sched.schedule_io(impl, detail::async_accept_t{});
+                sink(handle);
+            }
+        }
+
+        // Generic (backend-neutral) fallback for async_receive_sequence: a coroutine bound to Sched that
+        // recvs one datagram at a time into `bufs`'s buffer and hands each to `sink` (span valid only for
+        // the call), until stopped (-> set_stopped) or a fatal error. io_uring overrides this with multishot
+        // recv (uring_scheduler::receive_multishot into a kernel buf_ring). One-at-a-time recv gives the
+        // same synchronous-sink backpressure as multishot: the next recv waits until the sink returns.
+        template<typename Sched, typename Handle, typename Bufs, typename Sink>
+        auto receive_sequence_loop(Handle& impl, Sched sched, Bufs& bufs, Sink sink) -> coio::task<void, void, Sched> {
+            for (;;) {
+                const std::size_t n = co_await sched.schedule_io(impl, detail::async_receive_t{bufs.buffer()});
+                sink(bufs.buffer().first(n));
+            }
+        }
+
+        // A coroutine loop reports failure as set_error(exception_ptr); the multishot lowering — and every
+        // io_sender — reports set_error(std::error_code). An io failure thrown by co_await is a
+        // std::system_error; anything else maps to a generic io_error (shouldn't occur on these paths).
+        [[nodiscard]] inline auto exception_to_error_code(std::exception_ptr ep) noexcept -> std::error_code {
+            try { std::rethrow_exception(ep); }
+            catch (const std::system_error& e) { return e.code(); }
+            catch (...) { return std::make_error_code(std::errc::io_error); }
+        }
+
+        // Runs Child (a loop coroutine, which fails with set_error(exception_ptr)) and rewrites that into
+        // set_error(std::error_code), so a sequence's loop lowering advertises the SAME completion
+        // signatures as its multishot lowering <set_value_t(), set_error_t(error_code), set_stopped_t()> —
+        // one backend-neutral contract. NB: these signatures are declared EXPLICITLY (not via let_error,
+        // which needs a non-empty env to report them; the coroutine await path queries them with none).
+        template<typename Child>
+        struct error_code_sequence_sender {
+            using sender_concept = execution::sender_tag;
+            using completion_signatures = execution::completion_signatures<
+                execution::set_value_t(), execution::set_error_t(std::error_code), execution::set_stopped_t()>;
+
+            template<typename Rcvr>
+            struct state {
+                using operation_state_concept = execution::operation_state_tag;
+
+                // Separate holder (à la stop_when) so `receiver` points at a COMPLETE type — referencing the
+                // enclosing state before it's instantiated is ill-formed. `receiver` forwards the downstream
+                // env unchanged, so the child task still resolves its bound scheduler from it.
+                struct data_t { Rcvr rcvr; };
+
+                struct receiver {
+                    using receiver_concept = execution::receiver_tag;
+                    auto get_env() const noexcept { return execution::get_env(d->rcvr); }
+                    auto set_value() && noexcept -> void { execution::set_value(std::move(std::exchange(d, nullptr)->rcvr)); }
+                    auto set_error(std::exception_ptr ep) && noexcept -> void {
+                        execution::set_error(std::move(std::exchange(d, nullptr)->rcvr), exception_to_error_code(ep));
+                    }
+                    auto set_stopped() && noexcept -> void { execution::set_stopped(std::move(std::exchange(d, nullptr)->rcvr)); }
+                    data_t* d;
+                };
+
+                using inner_t = execution::connect_result_t<Child, receiver>;
+                state(Child child, Rcvr rcvr) : data{std::move(rcvr)}, inner(execution::connect(std::move(child), receiver{&data})) {}
+                auto start() & noexcept -> void { execution::start(inner); }
+
+                data_t data;
+                inner_t inner;
+            };
+
+            template<similar_to<error_code_sequence_sender>, typename...>
+            static consteval auto get_completion_signatures() noexcept -> completion_signatures { return {}; }
+            template<execution::receiver Rcvr>
+            auto connect(Rcvr rcvr) && -> state<Rcvr> { return state<Rcvr>{std::move(child), std::move(rcvr)}; }
+
+            Child child;
+        };
+
+        template<typename Child>
+        [[nodiscard]] auto as_error_code_sequence(Child child) {
+            return error_code_sequence_sender<Child>{std::move(child)};
+        }
+    }
 
     template<typename Protocol, io_scheduler IoScheduler>
     class basic_socket_acceptor : public basic_socket<Protocol, IoScheduler> {
@@ -553,6 +642,36 @@ namespace coio {
         }
 
         /**
+         * \brief keep accepting connections, delivering each to `sink`, until stopped.
+         * \param sink invoked ON THE OWNER THREAD once per accepted connection with a socket bound to this
+         *  acceptor's scheduler (valid to move out of the call). Consumers should be synchronous.
+         * \return a sequence-shaped sender completing when accepting ends: stopped on cancellation, error on
+         *  a fatal accept error. Compose with `stop_when(...)` to bound its lifetime.
+         * \note One high-level API, backend-specific lowering: on io_uring this arms a single multishot
+         *  accept (one SQE, many connections — the fast path); on epoll/iocp it is a re-issued single-shot
+         *  accept loop. User code is identical either way.
+         */
+        template<typename Sink>
+        [[nodiscard]]
+        COIO_ALWAYS_INLINE auto async_accept_sequence(Sink sink) {
+            auto sched = this->get_io_scheduler();
+            // Wrap each minted native_handle into a socket on our scheduler, then hand it to the user sink.
+            // Kept here (not in the backend) so async_accept_t stays backend-clean (yields native_handle).
+            auto handle_sink = [sink = std::move(sink), sched](native_handle_type h) mutable {
+                sink(protocol_socket_<scheduler_type>{sched, h});
+            };
+            if constexpr (requires { sched.accept_multishot(this->impl_, handle_sink); }) {
+                return sched.accept_multishot(this->impl_, std::move(handle_sink));            // io_uring multishot
+            }
+            else {
+                // Normalize the loop coroutine's exception_ptr error to error_code so both lowerings share
+                // one completion-signature set.
+                return detail::as_error_code_sequence(
+                    detail::accept_sequence_loop<scheduler_type>(this->impl_, sched, std::move(handle_sink)));
+            }
+        }
+
+        /**
          * \brief start an asynchronous accept.
          * \return a sender of `protocol_type::socket<scheduler_type>`.
          * \throw std::system_error on failure.
@@ -637,22 +756,9 @@ namespace coio {
         */
         [[nodiscard]]
         COIO_ALWAYS_INLINE auto async_read_some(std::span<std::byte> buffer) {
-            return let_value(
-                this->get_io_scheduler().schedule_io(
-                    this->impl_,
-                    detail::async_receive_t{buffer}
-                ),
-                [total = buffer.size()](std::size_t bytes_transferred) noexcept {
-                    async_result<execution::set_value_t(std::size_t), execution::set_error_t(std::error_code)> result;
-                    if (bytes_transferred == 0 and total > 0) [[unlikely]] {
-                        result.set_error(error::eof);
-                    }
-                    else {
-                        result.set_value(bytes_transferred);
-                    }
-                    return result;
-                }
-            );
+            // EOF-on-zero folded into the backend completion (async_stream_receive_t::eof_on_zero) — no
+            // wrapping let_value, one fewer sender/op-state per recv. Stream recv (TCP): 0 == peer closed.
+            return this->get_io_scheduler().schedule_io(this->impl_, detail::async_stream_receive_t{buffer});
         }
 
         /**
@@ -768,21 +874,29 @@ namespace coio {
         }
 
         /**
-         * \brief receive many datagrams from one armed operation (multishot).
-         * \param buffers the caller-owned provided-buffer group the kernel draws datagram buffers from.
-         * \param sink invoked once per datagram, on the owner thread, with the datagram bytes; the span
-         *  is valid only for the duration of the call (its buffer is recycled to `buffers` immediately
-         *  after). Consumers must be synchronous.
-         * \return a sender completing when the multishot ends: stopped on cancellation, error on a fatal
-         *  ring error.
-         * \note connected-socket only (plain receive, no per-datagram source address). Only available on
-         *  schedulers whose backend supports multishot (defines `buffer_group`), e.g. io_uring.
+         * \brief keep receiving datagrams, delivering each to `sink`, until stopped.
+         * \param bufs the provided-buffer group (IoScheduler::buffer_pool: a kernel buf_ring on io_uring, a
+         *  single reused buffer on epoll). Construct uniformly as `buffer_pool{ctx, count, size, bgid}`.
+         * \param sink invoked ON THE OWNER THREAD once per datagram with its bytes; the span is valid only
+         *  for the duration of the call. Consumers must be synchronous.
+         * \return a sequence-shaped sender completing when receiving ends: stopped on cancellation, error on
+         *  a fatal error. Compose with `stop_when(...)` to bound its lifetime.
+         * \note One high-level API, backend-specific lowering: io_uring arms one multishot recv (fast path);
+         *  epoll/iocp re-issue single-shot recv in a loop. User code is identical. Connected-socket only.
          */
-        template<typename BufferGroup, typename Sink>
-            requires std::same_as<BufferGroup, typename IoScheduler::buffer_group>
+        template<typename BufferPool, typename Sink>
+            requires std::same_as<BufferPool, typename IoScheduler::buffer_pool>
         [[nodiscard]]
-        COIO_ALWAYS_INLINE auto async_receive_multishot(BufferGroup& buffers, Sink sink) {
-            return this->get_io_scheduler().receive_multishot(this->impl_, buffers, std::move(sink));
+        COIO_ALWAYS_INLINE auto async_receive_sequence(BufferPool& bufs, Sink sink) {
+            auto sched = this->get_io_scheduler();
+            if constexpr (requires { sched.receive_multishot(this->impl_, bufs, sink); }) {
+                return sched.receive_multishot(this->impl_, bufs, std::move(sink));                // io_uring multishot
+            }
+            else {
+                // Normalize the loop coroutine's exception_ptr error to error_code (see as_error_code_sequence).
+                return detail::as_error_code_sequence(
+                    detail::receive_sequence_loop<scheduler_type>(this->impl_, sched, bufs, std::move(sink)));
+            }
         }
 
         /**

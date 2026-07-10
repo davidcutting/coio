@@ -92,7 +92,7 @@ namespace coio {
             detail::async_read_some_t, detail::async_write_some_t,
             detail::async_read_some_at_t, detail::async_write_some_at_t,
             detail::async_stream_send_t, detail::async_datagram_send_t,
-            detail::async_receive_t, detail::async_receive_from_t, detail::async_send_to_t,
+            detail::async_receive_t, detail::async_stream_receive_t, detail::async_receive_from_t, detail::async_send_to_t,
             detail::async_accept_t, detail::async_connect_t, detail::async_sleep_t>;
         template<typename IoOp>
         static constexpr bool supports = supported_io_ops::template contains<IoOp>;
@@ -220,6 +220,13 @@ namespace coio {
                 }
                 else {
                     if constexpr (std::same_as<typename Sexpr::value_signature, execution::set_value_t()>) result.set_value();
+                    // Fold the EOF-on-zero convention for stream reads (was a facade let_value). Only these
+                    // ops carry a std::span `buffer`; send_to's generic path has a ::iovec, so guard on the
+                    // flag so we never touch buffer for a non-read op.
+                    else if constexpr (is_eof_on_zero<Sexpr>) {
+                        if (cqe_res == 0 and not this->buffer.empty()) [[unlikely]] result.set_error(coio::error::eof);
+                        else result.set_value(cqe_res);
+                    }
                     else result.set_value(cqe_res);
                 }
                 return true;
@@ -249,6 +256,7 @@ namespace coio {
         template<> auto uring_state_base_for<async_read_some_at_t>::prepare(::io_uring_sqe*) noexcept -> void;
         template<> auto uring_state_base_for<async_write_some_at_t>::prepare(::io_uring_sqe*) noexcept -> void;
         template<> auto uring_state_base_for<async_receive_t>::prepare(::io_uring_sqe*) noexcept -> void;
+        template<> auto uring_state_base_for<async_stream_receive_t>::prepare(::io_uring_sqe*) noexcept -> void;
         template<> auto uring_state_base_for<async_stream_send_t>::prepare(::io_uring_sqe*) noexcept -> void;
         template<> auto uring_state_base_for<async_datagram_send_t>::prepare(::io_uring_sqe*) noexcept -> void;
         template<> auto uring_state_base_for<async_receive_from_t>::prepare(::io_uring_sqe*) noexcept -> void;
@@ -328,9 +336,9 @@ namespace coio {
         // fixed-file index when that lands, with no change to any facade. See detail::native_handle.
         using native_handle_type = detail::native_handle;
         // The provided-buffer group type for multishot receive. Naming it here (rather than the concrete
-        // buffer_ring) lets the generic socket facade take `typename IoScheduler::buffer_group&` without
+        // buffer_ring) lets the generic socket facade take `typename IoScheduler::buffer_pool&` without
         // depending on any uring type — backends without multishot simply don't define it.
-        using buffer_group = buffer_ring;
+        using buffer_pool = buffer_ring;
         using Base::Base;
 
         // Internal, facaded by socket/file (held as their impl_). Precondition: the owning facade — and
@@ -494,10 +502,89 @@ namespace coio {
 
         // Arm a multishot receive on `obj`'s fd, drawing datagram buffers from `bufs`. Tied to the
         // io_handle (inflight tracking + cancel_fd teardown) like every other io op. See
-        // multishot_recv_sender; facaded by basic_datagram_socket::async_receive_multishot.
+        // multishot_recv_sender; the multishot lowering behind basic_datagram_socket::async_receive_sequence.
         template<typename Sink>
         [[nodiscard]] auto receive_multishot(io_handle& obj, buffer_ring& bufs, Sink sink) const noexcept {
             return multishot_recv_sender<Sink>{this->ctx_, obj.fd_, &obj.inflight_, &bufs, std::move(sink)};
+        }
+
+        // Multishot accept: one armed SQE delivers many connections. `sink` is invoked per accepted
+        // connection ON THE OWNER THREAD with the freshly-minted fd wrapped as a native_handle (no raw fd
+        // escapes). The sender completes when the multishot ends: set_stopped on cancellation, set_error on
+        // a fatal error. The io_uring fast path behind basic_socket_acceptor::async_accept_sequence — the
+        // generic loop (detail::accept_sequence_loop) is the fallback for backends without multishot.
+        template<typename Sink>
+        struct multishot_accept_sender {
+            using sender_concept = execution::sender_tag;
+            using completion_signatures = execution::completion_signatures<
+                execution::set_value_t(), execution::set_error_t(std::error_code), execution::set_stopped_t()>;
+
+            template<typename Rcvr>
+            struct state_base : uring_driver::operation {
+                state_base(Executor& ctx, int fd, std::atomic<int>* inflight, Sink sink, Rcvr rcvr) noexcept
+                    : uring_driver::operation(ctx.template get_driver<capability::io>()),
+                      context_(ctx), fd_(fd), inflight_(inflight), sink_(std::move(sink)), rcvr_(std::move(rcvr)) {}
+
+                auto prepare(::io_uring_sqe* sqe) noexcept -> void override {
+                    ::io_uring_prep_multishot_accept(sqe, fd_, nullptr, nullptr, 0);
+                }
+
+                auto on_completion(int res, unsigned flags) -> bool override {
+                    if (res >= 0) {
+                        sink_(detail::to_handle(res));                 // wrap the minted fd at the boundary
+                        if (flags & IORING_CQE_F_MORE) return false;   // still armed for more connections
+                        return not rearm();                            // armed dropped -> re-arm, else terminal
+                    }
+                    const std::error_code ec{-res, std::system_category()};
+                    if (ec == std::errc::operation_canceled) { result_.set_stopped(); return true; }
+                    result_.set_error(ec);
+                    return true;
+                }
+
+                auto rearm() noexcept -> bool {
+                    if (driver_.submit(*this)) return true;
+                    result_.set_error(std::make_error_code(std::errc::no_buffer_space));
+                    return false;
+                }
+                auto do_start() noexcept -> bool {
+                    if (inflight_ != nullptr)
+                        inflight_->store(inflight_->load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+                    return rearm();
+                }
+                auto do_finish(bool) noexcept -> void {
+                    if (inflight_ != nullptr)
+                        inflight_->store(inflight_->load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+                    result_.forward_to(std::move(rcvr_));
+                }
+
+                Executor& context_; // NOLINT(*-avoid-const-or-ref-data-members)
+                int fd_;
+                std::atomic<int>* inflight_;
+                Sink sink_;
+                Rcvr rcvr_;
+                async_result<execution::set_value_t(), execution::set_error_t(std::error_code)> result_;
+            };
+            template<typename Rcvr>
+            using state = detail::operation_state<state_base<Rcvr>>;
+
+            template<execution::receiver Rcvr>
+            COIO_ALWAYS_INLINE auto connect(Rcvr rcvr) && -> state<Rcvr> {
+                COIO_ASSERT(context != nullptr);
+                return state<Rcvr>{*std::exchange(context, nullptr), fd, inflight, std::move(sink), std::move(rcvr)};
+            }
+            template<similar_to<multishot_accept_sender>, typename...>
+            static consteval auto get_completion_signatures() noexcept -> completion_signatures { return {}; }
+            COIO_ALWAYS_INLINE auto get_env() const noexcept -> detail::exec_env<Executor> { return {*context}; }
+
+            Executor* context;
+            int fd;
+            std::atomic<int>* inflight;
+            Sink sink;
+        };
+
+        template<typename Sink>
+        [[nodiscard]] auto accept_multishot(io_handle& obj, Sink sink) const noexcept {
+            return multishot_accept_sender<Sink>{this->ctx_, obj.fd_, &obj.inflight_, std::move(sink)};
         }
 
         [[nodiscard]] static auto now() noexcept -> std::chrono::steady_clock::time_point {

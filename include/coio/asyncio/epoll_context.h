@@ -106,7 +106,7 @@ namespace coio {
         using supported_io_ops = type_list<
             detail::async_read_some_t, detail::async_write_some_t,
             detail::async_stream_send_t, detail::async_datagram_send_t,
-            detail::async_receive_t, detail::async_receive_from_t, detail::async_send_to_t,
+            detail::async_receive_t, detail::async_stream_receive_t, detail::async_receive_from_t, detail::async_send_to_t,
             detail::async_accept_t, detail::async_connect_t>;
         template<typename IoOp>
         static constexpr bool supports = supported_io_ops::template contains<IoOp>;
@@ -194,6 +194,8 @@ namespace coio {
         template<> auto epoll_state_base_for<async_datagram_send_t>::do_perform() noexcept -> bool;
         template<> auto epoll_state_base_for<async_receive_t>::do_start() noexcept -> bool;
         template<> auto epoll_state_base_for<async_receive_t>::do_perform() noexcept -> bool;
+        template<> auto epoll_state_base_for<async_stream_receive_t>::do_start() noexcept -> bool;
+        template<> auto epoll_state_base_for<async_stream_receive_t>::do_perform() noexcept -> bool;
         template<> auto epoll_state_base_for<async_receive_from_t>::do_start() noexcept -> bool;
         template<> auto epoll_state_base_for<async_receive_from_t>::do_perform() noexcept -> bool;
         template<> auto epoll_state_base_for<async_send_to_t>::do_start() noexcept -> bool;
@@ -204,6 +206,20 @@ namespace coio {
         template<> auto epoll_state_base_for<async_connect_t>::do_perform() noexcept -> bool;
     }
 
+    // epoll's provided-buffer analog for async_receive_sequence: one reused buffer the loop fallback recvs
+    // into (epoll has no kernel buf_ring). Ctor matches uring's buffer_ring (ctx, count, buffer_size, bgid)
+    // so `IoScheduler::buffer_pool bufs{ctx, n, size, bgid}` constructs uniformly across backends; count &
+    // bgid are ignored here (a single buffer, since the loop processes one datagram at a time before the
+    // next recv — same synchronous-sink backpressure as multishot). Owns its storage; outlive the sequence.
+    class epoll_buffer_pool {
+    public:
+        epoll_buffer_pool(executor<epoll_driver>& /*ctx*/, unsigned /*count*/, unsigned buffer_size, int /*bgid*/)
+            : storage_(buffer_size) {}
+        [[nodiscard]] auto buffer() noexcept -> std::span<std::byte> { return storage_; }
+    private:
+        std::vector<std::byte> storage_;
+    };
+
     // A scheduler mixin (not a standalone scheduler): adds epoll's io + timer senders on top of Base,
     // which is executor_scheduler or another driver's mixin. The default Base keeps the plain
     // `epoll_scheduler<Ex>` spelling equal to epoll_context's composed scheduler type.
@@ -213,6 +229,8 @@ namespace coio {
         using scheduler_concept = detail::io_scheduler_tag;
         // Opaque handle for this backend. epoll always holds a real fd, so the codec is identity forever.
         using native_handle_type = detail::native_handle;
+        // The provided-buffer group for async_receive_sequence's loop fallback (epoll has no multishot).
+        using buffer_pool = epoll_buffer_pool;
         using Base::Base;
 
         // Internal, facaded by socket/file (held as their impl_). Precondition: the owning facade — and

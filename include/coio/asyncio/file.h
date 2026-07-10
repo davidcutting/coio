@@ -307,22 +307,9 @@ namespace coio {
              */
             [[nodiscard]]
             COIO_ALWAYS_INLINE auto async_read_some(std::span<std::byte> buffer) {
-                return let_value(
-                    this->get_io_scheduler().schedule_io(
-                        this->impl_,
-                        detail::async_read_some_t{buffer}
-                    ),
-                    [total = buffer.size()](std::size_t bytes_transferred) noexcept {
-                        async_result<execution::set_value_t(std::size_t), execution::set_error_t(std::error_code)> result;
-                        if (bytes_transferred == 0 and total > 0) [[unlikely]] {
-                            result.set_error(error::eof);
-                        }
-                        else {
-                            result.set_value(bytes_transferred);
-                        }
-                        return result;
-                    }
-                );
+                // EOF-on-zero is folded into the backend completion (async_read_some_t::eof_on_zero), so no
+                // wrapping let_value here — one fewer sender/op-state per read.
+                return this->get_io_scheduler().schedule_io(this->impl_, detail::async_read_some_t{buffer});
             }
 
             /**
@@ -389,22 +376,8 @@ namespace coio {
                 std::size_t offset,
                 std::span<std::byte> buffer
             ) {
-                return let_value(
-                    this->get_io_scheduler().schedule_io(
-                        this->impl_,
-                        detail::async_read_some_at_t{offset, buffer}
-                    ),
-                    [total = buffer.size()](std::size_t bytes_transferred) noexcept {
-                        async_result<execution::set_value_t(std::size_t), execution::set_error_t(std::error_code)> result;
-                        if (bytes_transferred == 0 and total > 0) [[unlikely]] {
-                            result.set_error(error::eof);
-                        }
-                        else {
-                            result.set_value(bytes_transferred);
-                        }
-                        return result;
-                    }
-                );
+                // EOF-on-zero folded into the backend completion (async_read_some_at_t::eof_on_zero).
+                return this->get_io_scheduler().schedule_io(this->impl_, detail::async_read_some_at_t{offset, buffer});
             }
 
             /**

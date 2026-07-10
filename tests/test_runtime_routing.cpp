@@ -4,6 +4,10 @@
 #include <doctest/doctest.h>
 #include <coio/core.h>
 #include <coio/init.h>
+
+// Uses io_uring pools explicitly (and includes its header, which #errors without liburing) — skip where
+// io_uring is unavailable. The p2c routing itself is backend-agnostic (see test_heterogeneous_runtime).
+#if COIO_HAS_IO_URING
 #include <coio/asyncio/uring_context.h>
 
 TEST_CASE("spawn_on<Cap> distributes across multiple eligible pools (power-of-two-choices)") {
@@ -44,3 +48,7 @@ TEST_CASE("spawn_on<Cap> with a single eligible pool still routes there (fast pa
     }
     CHECK(ok.load() == 8);
 }
+
+#else
+TEST_CASE("runtime routing (skipped: build has no io_uring)") { CHECK(true); }
+#endif

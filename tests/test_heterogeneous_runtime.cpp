@@ -3,6 +3,10 @@
 #include <doctest/doctest.h>
 #include <coio/core.h>
 #include <coio/init.h>
+
+// This case is specifically io_uring + epoll cores in one process — skip where either is unavailable
+// (Windows/IOCP). The heterogeneous machinery is otherwise backend-agnostic.
+#if COIO_HAS_IO_URING and COIO_HAS_EPOLL
 #include <coio/asyncio/uring_context.h>
 #include <coio/asyncio/epoll_context.h>
 
@@ -40,3 +44,7 @@ TEST_CASE("heterogeneous runtime: 2 uring + 2 epoll, capability-routed spawn, cl
     } // rt destroyed -> stop() joins all 4 threads
     CHECK(ok.load() == 12);
 }
+
+#else
+TEST_CASE("heterogeneous runtime (skipped: needs io_uring + epoll)") { CHECK(true); }
+#endif

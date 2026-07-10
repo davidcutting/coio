@@ -147,7 +147,7 @@ namespace {
     auto ms_consumer(udp_socket& rx, coio::buffer_ring& bufs, long& received,
                      coio::inplace_stop_token tok) -> io_context::task<> {
         co_await coio::stop_when(
-            rx.async_receive_multishot(bufs, [&](std::span<std::byte>) noexcept { ++received; }), tok);
+            rx.async_receive_sequence(bufs, [&](std::span<std::byte>) noexcept { ++received; }), tok);
     }
 
     auto ms_sender(io_context::scheduler sched, udp_socket& tx, std::span<const std::byte> payload,

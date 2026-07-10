@@ -295,14 +295,15 @@ namespace coio {
                     result.set_stopped();
                 }
                 else if (error == ERROR_HANDLE_EOF) {
-                    result.set_value(0);
+                    // EOF-on-zero fold (was the facade let_value): 0 bytes on a non-empty buffer -> eof error.
+                    deliver_read_result<async_read_some_t>(result, 0, buffer.empty());
                 }
                 else {
                     result.set_error(to_error_code(error));
                 }
             }
             else {
-                result.set_value(bytes);
+                deliver_read_result<async_read_some_t>(result, bytes, buffer.empty());
             }
         }
 
@@ -383,11 +384,11 @@ namespace coio {
         auto iocp_state_base_for<async_read_some_at_t>::complete(::DWORD bytes, ::DWORD error) noexcept -> void {
             if (error) {
                 if (error == ERROR_OPERATION_ABORTED) result.set_stopped();
-                else if (error == ERROR_HANDLE_EOF) result.set_value(0);
+                else if (error == ERROR_HANDLE_EOF) deliver_read_result<async_read_some_at_t>(result, 0, buffer.empty());
                 else result.set_error(to_error_code(error));
             }
             else {
-                result.set_value(bytes);
+                deliver_read_result<async_read_some_at_t>(result, bytes, buffer.empty());
             }
         }
 
@@ -478,7 +479,51 @@ namespace coio {
                 result.set_error(to_error_code(error));
             }
             else {
-                result.set_value(bytes);
+                // Datagram recv: 0 bytes is a legitimate empty datagram, NOT eof (async_receive_t has no
+                // eof_on_zero) — deliver_read_result just forwards the count here.
+                deliver_read_result<async_receive_t>(result, bytes, buffer.empty());
+            }
+        }
+
+        /// async_stream_receive — same WSARecv as async_receive, but eof_on_zero folds a 0-byte stream recv
+        /// on a non-empty buffer into error::eof (TCP peer closed). Separate type = the EOF semantic.
+        template<>
+        auto iocp_state_base_for<async_stream_receive_t>::do_start() noexcept -> bool {
+            if (handle == INVALID_HANDLE_VALUE) [[unlikely]] {
+                result.set_error(std::make_error_code(std::errc::bad_file_descriptor));
+                return false;
+            }
+            if (buffer.empty()) [[unlikely]] {
+                result.set_value(0);
+                return false;
+            }
+
+            ::WSABUF wsabuf = span_to_wsabuf(buffer);
+            ::DWORD bytes_received = 0;
+            ::DWORD flags = 0;
+            const int rc = ::WSARecv(std::bit_cast<::SOCKET>(handle), &wsabuf, 1, &bytes_received, &flags, this, nullptr);
+            if (rc == SOCKET_ERROR) {
+                const int err = ::WSAGetLastError();
+                if (err == WSA_IO_PENDING) return true;
+                complete(0, static_cast<::DWORD>(err));
+                return false;
+            }
+            return true;
+        }
+
+        template<>
+        auto iocp_state_base_for<async_stream_receive_t>::complete(::DWORD bytes, ::DWORD error) noexcept -> void {
+            if (error) {
+                if (error == ERROR_OPERATION_ABORTED) {
+                    result.set_stopped();
+                    return;
+                }
+                if (error == ERROR_NETNAME_DELETED) error = WSAECONNRESET;
+                else if (error == ERROR_PORT_UNREACHABLE) error = WSAECONNREFUSED;
+                result.set_error(to_error_code(error));
+            }
+            else {
+                deliver_read_result<async_stream_receive_t>(result, bytes, buffer.empty());
             }
         }
 

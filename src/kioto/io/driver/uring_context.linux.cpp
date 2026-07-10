@@ -10,7 +10,6 @@
 
 namespace kioto {
     namespace {
-        constexpr std::size_t default_uring_entries = 4096;
         constexpr std::size_t submit_batch_size = 32;
         constexpr std::uint64_t wake_user_data = 0x6b69'6f74'7761'6b65ULL; // "kiotwake"
 
@@ -36,7 +35,7 @@ namespace kioto {
     }
 
     uring_driver::uring_driver(std::size_t entries) { init_uring(uring_, entries); }
-    uring_driver::uring_driver() : uring_driver(default_uring_entries) {}
+    uring_driver::uring_driver() : uring_driver(default_entries) {}
     uring_driver::~uring_driver() { ::io_uring_queue_exit(&uring_); }
 
     auto uring_driver::operation::submit_cancel() -> void { // owner thread only (touches the ring)

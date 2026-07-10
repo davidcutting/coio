@@ -89,7 +89,7 @@ namespace kioto {
                 auto pop_all(int signal_number) noexcept -> void {
                     std::unique_lock guard{mtx};
                     node_t* waiter = head == this ? nullptr : static_cast<node_t*>(head);
-                    head = signal_number < 0 ? this : nullptr;
+                    head = this;   // back to the empty sentinel; a later wait must re-arm, not short-circuit
                     while (waiter != nullptr) {
                         auto next = waiter->next_;
                         if (next) next->prev_ = nullptr;

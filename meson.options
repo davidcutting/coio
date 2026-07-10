@@ -1,0 +1,13 @@
+# std::execution backend (mirrors the CMake KIOTO_SENDERS_BACKEND cache var):
+#   NVIDIA - NVIDIA/stdexec       (C++20; fetched as a subproject if not installed)
+#   BEMAN  - bemanproject/execution (C++23)
+#   CXX26  - the C++26 standard library <execution>
+option('senders_backend', type : 'combo', choices : ['NVIDIA', 'BEMAN', 'CXX26'],
+       value : 'NVIDIA', description : 'std::execution implementation to build against')
+
+option('mimalloc', type : 'feature', value : 'auto',
+       description : 'link mimalloc as the process default allocator (auto: use if found; disabled under sanitizers)')
+
+option('tests',      type : 'boolean', value : false, description : 'build the test suite')
+option('benchmarks', type : 'boolean', value : false, description : 'build the benchmarks')
+option('examples',   type : 'boolean', value : false, description : 'build the examples')

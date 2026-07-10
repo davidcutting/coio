@@ -11,7 +11,7 @@ namespace kioto {
         template<thread_launcher Launcher = default_thread_launcher>
         explicit uring_runtime(
             std::size_t workers = basic_runtime<uring_context>::default_worker_count(),
-            std::size_t entries = 512,
+            std::size_t entries = uring_driver::default_entries,
             Launcher launch = {}
         ) : basic_runtime<uring_context>(
                 workers,

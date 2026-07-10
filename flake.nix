@@ -19,11 +19,13 @@
               clang-tools
               lldb
               cmake
+              meson
               ninja
               pkg-config
 
               lcov
               gcovr
+              llvmPackages.llvm   # llvm-cov, for `meson ... -Db_coverage=true` under clang
               perf
               gdb
 

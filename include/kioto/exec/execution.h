@@ -40,7 +40,6 @@ namespace kioto::detail {
 
 namespace kioto {
 #if defined(KIOTO_EXECUTION_USE_NVIDIA) or defined(KIOTO_EXECUTION_USE_BEMAN)
-    using detail::execution_impl::forwarding_query_t;
     using detail::execution_impl::get_allocator_t;
     using detail::execution_impl::get_stop_token_t;
 
@@ -53,13 +52,10 @@ namespace kioto {
         using ::std::this_thread::get_id;
         using ::std::this_thread::sleep_for;
         using ::std::this_thread::sleep_until;
-        using detail::execution_impl::sync_wait_t;
-        using detail::execution_impl::sync_wait_with_variant_t;
         using detail::execution_impl::sync_wait;
         using detail::execution_impl::sync_wait_with_variant;
     }
 #else
-    using ::std::forwarding_query_t;
     using ::std::get_allocator_t;
     using ::std::get_stop_token_t;
 
@@ -71,14 +67,10 @@ namespace kioto {
 #endif
 
     namespace execution {
-        using detail::execution_impl::get_domain_t;
-        using detail::execution_impl::get_completion_domain_t;
         using detail::execution_impl::get_scheduler_t;
         using detail::execution_impl::get_start_scheduler_t;
         using detail::execution_impl::get_completion_scheduler_t;
-        using detail::execution_impl::get_delegation_scheduler_t;
         using detail::execution_impl::get_forward_progress_guarantee_t;
-        using detail::execution_impl::get_await_completion_adaptor_t;
 
         using detail::execution_impl::get_domain;
         using detail::execution_impl::get_completion_domain;
@@ -105,9 +97,7 @@ namespace kioto {
         using detail::execution_impl::schedule_result_t;
         using detail::execution_impl::scheduler;
 
-        using detail::execution_impl::connect_t;
         using detail::execution_impl::connect_result_t;
-        using detail::execution_impl::start_t;
         using detail::execution_impl::connect;
         using detail::execution_impl::start;
 
@@ -126,12 +116,10 @@ namespace kioto {
 
         using detail::execution_impl::forward_progress_guarantee;
 
-        using detail::execution_impl::tag_of_t;
 
         using detail::execution_impl::env;
         using detail::execution_impl::prop;
         using detail::execution_impl::env_of_t;
-        using detail::execution_impl::get_env_t;
         using detail::execution_impl::get_env;
         using detail::execution_impl::write_env;
         using detail::execution_impl::read_env;
@@ -143,46 +131,26 @@ namespace kioto {
 
         using detail::execution_impl::sender_adaptor_closure;
 
-        using detail::execution_impl::just_t;
-        using detail::execution_impl::just_error_t;
-        using detail::execution_impl::just_stopped_t;
         using detail::execution_impl::just;
         using detail::execution_impl::just_error;
         using detail::execution_impl::just_stopped;
 
-        using detail::execution_impl::then_t;
-        using detail::execution_impl::upon_error_t;
-        using detail::execution_impl::upon_stopped_t;
         using detail::execution_impl::then;
         using detail::execution_impl::upon_error;
         using detail::execution_impl::upon_stopped;
 
-        using detail::execution_impl::let_value_t;
-        using detail::execution_impl::let_error_t;
-        using detail::execution_impl::let_stopped_t;
         using detail::execution_impl::let_value;
         using detail::execution_impl::let_error;
         using detail::execution_impl::let_stopped;
 
-        using detail::execution_impl::when_all_t;
-        using detail::execution_impl::when_all_with_variant_t;
         using detail::execution_impl::when_all;
         using detail::execution_impl::when_all_with_variant;
 
-        using detail::execution_impl::into_variant_t;
-        using detail::execution_impl::stopped_as_error_t;
-        using detail::execution_impl::stopped_as_optional_t;
         using detail::execution_impl::into_variant;
         using detail::execution_impl::unstoppable;
         using detail::execution_impl::stopped_as_error;
         using detail::execution_impl::stopped_as_optional;
 
-        using detail::execution_impl::schedule_t;
-        using detail::execution_impl::affine_t;
-        using detail::execution_impl::schedule_from_t;
-        using detail::execution_impl::continues_on_t;
-        using detail::execution_impl::starts_on_t;
-        using detail::execution_impl::on_t;
         using detail::execution_impl::schedule;
         using detail::execution_impl::affine;
         using detail::execution_impl::schedule_from;
@@ -191,7 +159,6 @@ namespace kioto {
         using detail::execution_impl::on;
 
         using detail::execution_impl::with_awaitable_senders;
-        using detail::execution_impl::as_awaitable_t;
         using detail::execution_impl::as_awaitable;
 
         using detail::execution_impl::inline_scheduler;
@@ -199,9 +166,6 @@ namespace kioto {
 
         using detail::execution_impl::scope_association;
         using detail::execution_impl::scope_token;
-        using detail::execution_impl::associate_t;
-        using detail::execution_impl::spawn_t;
-        using detail::execution_impl::spawn_future_t;
         using detail::execution_impl::counting_scope;
         using detail::execution_impl::simple_counting_scope;
         using detail::execution_impl::associate;

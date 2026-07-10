@@ -1,0 +1,10 @@
+[wrap-git]
+url = https://github.com/NVIDIA/stdexec
+revision = main
+depth = 1
+# stdexec is CMake-only and header-only; overlay a tiny meson.build that exposes
+# its include/ dir as a dependency (see subprojects/packagefiles/stdexec/).
+patch_directory = stdexec
+
+[provide]
+stdexec = stdexec_dep

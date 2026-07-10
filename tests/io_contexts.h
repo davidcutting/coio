@@ -26,6 +26,13 @@
 #define KIOTO_TEST_IO_CONTEXTS kioto::iocp_context
 #endif
 
+// The file-capable contexts (capability::file: io_uring/IOCP only — epoll can't serve regular files).
+#if KIOTO_HAS_IO_URING
+#define KIOTO_TEST_FILE_CONTEXTS kioto::uring_context
+#elif KIOTO_HAS_IOCP
+#define KIOTO_TEST_FILE_CONTEXTS kioto::iocp_context
+#endif
+
 namespace kioto_test {
     // Any single-owner io-capable context, for tests that only need "a worker".
 #if KIOTO_HAS_IO_URING

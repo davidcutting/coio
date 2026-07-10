@@ -1,0 +1,5 @@
+# Fetched subproject sources are not vendored; keep the wraps + overlays only.
+/*
+!/.gitignore
+!/*.wrap
+!/packagefiles/

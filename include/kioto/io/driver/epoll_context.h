@@ -274,7 +274,15 @@ namespace kioto {
             // owner may hold buffered epoll events (peer-close EPOLLHUP) whose data.ptr is this data_. Owner-
             // deferral orders the free after both (release_fd's EPOLL_CTL_DEL stops NEW events first).
             auto reclaim(bool had_ops) -> void {
-                if (fd_ != -1) ctx_->template get_driver<capability::io>().release_fd(fd_, data_);
+                // An unregistered handle (fd == -1: never opened, or a socket whose open() failed) was never
+                // put in the reactor, so nothing can race data_ -> free inline on ANY thread. Deferring here
+                // would leak if the context never runs (nothing services the deferred free).
+                if (fd_ == -1) {
+                    ctx_->get_allocator().delete_object(data_);
+                    data_ = nullptr;
+                    return;
+                }
+                ctx_->template get_driver<capability::io>().release_fd(fd_, data_);
                 if (had_ops or not ctx_->is_owner())
                     detail::defer_to_owner(*ctx_, [ctx = ctx_, d = data_] { ctx->get_allocator().delete_object(d); });
                 else

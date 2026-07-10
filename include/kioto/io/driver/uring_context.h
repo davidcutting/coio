@@ -94,6 +94,9 @@ namespace kioto {
         template<typename IoOp>
         using io_state = detail::uring_state_base_for<IoOp>;
 
+        // SQ depth (CQ is 2x); ~105 B pinned (RLIMIT_MEMLOCK) per entry per ring, one ring per worker.
+        static constexpr std::size_t default_entries = 1024;
+
         explicit uring_driver(std::size_t entries);
         uring_driver();
         uring_driver(const uring_driver&) = delete;

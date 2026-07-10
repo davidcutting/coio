@@ -1,5 +1,5 @@
 #include <fstream>
-#include <coio/asyncio/io.h>
+#include <kioto/io/io.h>
 #include "router.h"
 
 namespace http {
@@ -68,7 +68,7 @@ namespace http {
     auto router::serve_home(const request& req, response& res) const -> void {
         std::filesystem::path index_file_path = static_dir_ / "index.html";
         res.status = response::ok;
-        res.content = coio::as_bytes(files_.at(index_file_path));
+        res.content = kioto::as_bytes(files_.at(index_file_path));
         res.headers.emplace("Content-Type", "text/html; charset=utf-8");
         res.headers.emplace("Content-Length", std::to_string(res.content.size()));
     }
@@ -97,7 +97,7 @@ namespace http {
         }
 
         res.status = response::ok;
-        res.content = coio::as_bytes(files_.at(file_path));
+        res.content = kioto::as_bytes(files_.at(file_path));
         res.headers.emplace("Content-Type", get_content_type(file_path.extension().string()));
         res.headers.emplace("Content-Length", std::to_string(res.content.size()));
         return true;

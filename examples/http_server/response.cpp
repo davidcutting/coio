@@ -1,5 +1,5 @@
 #include <string>
-#include <coio/asyncio/io.h>
+#include <kioto/io/io.h>
 #include "response.h"
 #include "../common.h"
 
@@ -51,9 +51,9 @@ namespace http {
         }
 
         line_and_headers += "\r\n";
-        co_await (coio::async_write(socket, coio::as_bytes(line_and_headers)) | as_throwing);
+        co_await (kioto::async_write(socket, kioto::as_bytes(line_and_headers)) | as_throwing);
 
-        co_await (coio::async_write(socket, content) | as_throwing);
+        co_await (kioto::async_write(socket, content) | as_throwing);
     }
 
 
@@ -63,7 +63,7 @@ namespace http {
         rep.headers.emplace("Content-Length", std::to_string(rep.content.size()));
         rep.headers.emplace("Content-Type", "text/plain");
         std::string_view default_content = stock_content(status);
-        rep.content = coio::as_bytes(default_content);
+        rep.content = kioto::as_bytes(default_content);
         return rep;
     }
 }

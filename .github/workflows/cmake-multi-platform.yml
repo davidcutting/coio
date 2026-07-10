@@ -117,7 +117,7 @@ jobs:
       # The io_uring backend needs liburing to compile, and a recent one: wake_up() calls
       # io_uring_register_sync_msg (added in liburing 2.6), which ubuntu-latest's apt package (2.5) lacks.
       # Build a PINNED tag from source (matches the local nix toolchain, 2.14) so the version is
-      # reproducible and definitely carries every symbol coio uses (buf_ring/multishot/register_sync_msg).
+      # reproducible and definitely carries every symbol kioto uses (buf_ring/multishot/register_sync_msg).
       - name: Build & install liburing (pinned)
         if: runner.os == 'Linux'
         env:
@@ -138,11 +138,11 @@ jobs:
           -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
           -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-          -DCOIO_BUILD_TESTS=ON
-          -DCOIO_BUILD_EXAMPLES=OFF
-          -DCOIO_BUILD_WITH_ASAN=${{ matrix.asan }}
-          -DCOIO_BUILD_WITH_UBSAN=${{ matrix.ubsan }}
-          -DCOIO_BUILD_WITH_TSAN=${{ matrix.tsan }}
+          -DKIOTO_BUILD_TESTS=ON
+          -DKIOTO_BUILD_EXAMPLES=OFF
+          -DKIOTO_BUILD_WITH_ASAN=${{ matrix.asan }}
+          -DKIOTO_BUILD_WITH_UBSAN=${{ matrix.ubsan }}
+          -DKIOTO_BUILD_WITH_TSAN=${{ matrix.tsan }}
 
       - name: Build
         run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }}

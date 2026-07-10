@@ -1,20 +1,20 @@
 #pragma once
-#include <coio/net/tcp.h>
+#include <kioto/net/tcp.h>
 
-#if COIO_OS_LINUX
-#include <coio/asyncio/epoll_context.h>
+#if KIOTO_OS_LINUX
+#include <kioto/io/driver/epoll_context.h>
 namespace http {
-    using io_executor = coio::epoll_context;
+    using io_executor = kioto::epoll_context;
 }
-#elif COIO_OS_WINDOWS
-#include <coio/asyncio/iocp_context.h>
+#elif KIOTO_OS_WINDOWS
+#include <kioto/io/driver/iocp_context.h>
 namespace http {
-    using io_executor = coio::iocp_context;
+    using io_executor = kioto::iocp_context;
 }
 #endif
 
 namespace http {
-    using tcp_socket = coio::tcp::socket<io_executor::scheduler>;
-    using tcp_acceptor = coio::tcp::acceptor<io_executor::scheduler>;
-    using tcp_resolver = coio::tcp::resolver<io_executor::scheduler>;
+    using tcp_socket = kioto::tcp::socket<io_executor::scheduler>;
+    using tcp_acceptor = kioto::tcp::acceptor<io_executor::scheduler>;
+    using tcp_resolver = kioto::tcp::resolver<io_executor::scheduler>;
 }

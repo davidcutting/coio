@@ -1,39 +1,39 @@
 #include <thread>
-#include <coio/core.h>
-#include <coio/asyncio/io.h>
-#include <coio/asyncio/pipe.h>
+#include <kioto/core.h>
+#include <kioto/io/io.h>
+#include <kioto/io/pipe.h>
 #include "common.h"
 
-#if COIO_OS_LINUX
-#include <coio/asyncio/epoll_context.h>
-using io_context = coio::epoll_context;
-#elif COIO_OS_WINDOWS
-#include <coio/asyncio/iocp_context.h>
-using io_context = coio::iocp_context;
+#if KIOTO_OS_LINUX
+#include <kioto/io/driver/epoll_context.h>
+using io_context = kioto::epoll_context;
+#elif KIOTO_OS_WINDOWS
+#include <kioto/io/driver/iocp_context.h>
+using io_context = kioto::iocp_context;
 #endif
 
 auto main() -> int {
     io_context context;
-    auto [reader, writer] = coio::make_pipe(context.get_scheduler());
-    coio::async_scope scope;
-    scope.spawn([](coio::pipe_reader<io_context::scheduler> r) -> coio::task<> {
+    auto [reader, writer] = kioto::make_pipe(context.get_scheduler());
+    kioto::async_scope scope;
+    scope.spawn([](kioto::pipe_reader<io_context::scheduler> r) -> kioto::task<> {
         try {
             char buffer[128];
             while (true) {
-                auto n = co_await r.async_read_some(coio::as_writable_bytes(buffer));
+                auto n = co_await r.async_read_some(kioto::as_writable_bytes(buffer));
                 std::string_view message{buffer, n};
                 std::clog << message;
                 if (message.ends_with('\n')) break;
             }
         }
         catch (std::system_error& e) {
-            if (e.code() != coio::error::eof) {
+            if (e.code() != kioto::error::eof) {
                 ::println("connection broken because of {}", e.what());
             }
         }
     }(std::move(reader)));
 
-    scope.spawn([](coio::pipe_writer<io_context::scheduler> w) -> coio::task<> {
+    scope.spawn([](kioto::pipe_writer<io_context::scheduler> w) -> kioto::task<> {
         std::string_view messages[]{
           "Lorem ipsum dolor sit amet, consectetur adipiscing elit",
           "sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
@@ -46,11 +46,11 @@ auto main() -> int {
           "\n"
         };
         for (std::string_view message : messages) {
-            co_await (coio::async_write(w, coio::as_bytes(message)) | as_throwing);
+            co_await (kioto::async_write(w, kioto::as_bytes(message)) | as_throwing);
         }
     }(std::move(writer)));
 
     context.run();
 
-    coio::this_thread::sync_wait(scope.join());
+    kioto::this_thread::sync_wait(scope.join());
 }

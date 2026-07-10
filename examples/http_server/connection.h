@@ -5,7 +5,7 @@
 namespace http {
     auto connection(
         tcp_socket socket,
-        coio::endpoint remote_endpoint,
+        kioto::endpoint remote_endpoint,
         router& router
     ) -> io_executor::task<>;
 }

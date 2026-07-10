@@ -1,0 +1,307 @@
+﻿#pragma once
+#include <compare>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string>
+#include <tuple>
+#include <type_traits>
+#include <kioto/base/config.h>
+#include <kioto/base/format.h>
+#if KIOTO_OS_WINDOWS
+#include <basetsd.h>
+#endif
+#include <kioto/base/suppress_push.h> // IWYU pragma: keep
+
+namespace kioto {
+    namespace detail {
+        // The raw OS primitive. Spoken only by the platform syscall layer and the kernel-mint boundary;
+        // everything above the driver traffics in the opaque native_handle instead.
+#if KIOTO_OS_LINUX
+        using native_fd = int;
+#elif KIOTO_OS_WINDOWS
+        using native_fd = ::UINT_PTR;
+#endif
+        inline constexpr native_fd invalid_socket_handle = native_fd(-1);
+
+        // Opaque, driver-owned handle (each io_scheduler aliases it as native_handle_type). The codec
+        // (handle_access, identity today) maps native_handle <-> native_fd; fixed-file support later swaps
+        // only the codec (fd -> registered index), leaving every facade untouched. Raw fd only via to_native().
+        class native_handle {
+        public:
+            constexpr native_handle() noexcept = default;
+            friend constexpr auto operator== (native_handle, native_handle) noexcept -> bool = default;
+
+        private:
+            explicit constexpr native_handle(std::uintptr_t bits) noexcept : bits_(bits) {}
+            std::uintptr_t bits_ = static_cast<std::uintptr_t>(-1); // empty == the invalid fd (-1 / INVALID_SOCKET)
+            friend struct handle_access;
+        };
+
+        struct handle_access {
+            // Identity codec: the handle's bits ARE the raw fd (sign-extended). fd -1 <-> the empty handle,
+            // so a default-constructed native_handle round-trips to the invalid fd (== invalid_socket_handle).
+            static constexpr auto to_handle(native_fd fd) noexcept -> native_handle {
+                return native_handle{static_cast<std::uintptr_t>(static_cast<std::intptr_t>(fd))};
+            }
+            static constexpr auto to_native(native_handle h) noexcept -> native_fd {
+                return static_cast<native_fd>(static_cast<std::intptr_t>(h.bits_));
+            }
+        };
+
+        // Explicit escape hatch: reach the raw fd from an opaque handle (and back). Callers that need the OS
+        // primitive (unwrapped syscalls, driver prepare()) go through here; ordinary facade code never does.
+        [[nodiscard]] constexpr auto to_native(native_handle h) noexcept -> native_fd { return handle_access::to_native(h); }
+        [[nodiscard]] constexpr auto to_handle(native_fd fd) noexcept -> native_handle { return handle_access::to_handle(fd); }
+    }
+
+    class ipv4_address {
+    public:
+        ipv4_address() = default;
+
+        explicit ipv4_address(std::uint32_t host_u32) noexcept;
+
+        ipv4_address(const std::string& str);
+
+        ipv4_address(std::uint8_t a, std::uint8_t b, std::uint8_t c, std::uint8_t d) noexcept : ipv4_address((std::uint32_t(a) << 24) | (std::uint32_t(b) << 16) | (std::uint32_t(c) << 8) | std::uint32_t(d)) {}
+
+        [[nodiscard]]
+        auto to_string() const -> std::string;
+
+        auto operator== (const ipv4_address& other) const noexcept -> bool;
+
+        auto operator<=> (const ipv4_address& other) const noexcept -> std::strong_ordering;
+
+        [[nodiscard]]
+        static auto loopback() noexcept ->ipv4_address {
+            return ipv4_address{0x7f000001u};
+        }
+
+        [[nodiscard]]
+        static auto any() noexcept ->ipv4_address {
+            return {};
+        }
+
+    private:
+        std::uint32_t net_u32_ = 0;
+    };
+
+    class ipv6_address {
+    public:
+        ipv6_address() = default;
+
+        ipv6_address(const std::string& str);
+
+        [[nodiscard]]
+        auto to_string() const -> std::string;
+
+        friend auto operator== (const ipv6_address& lhs, const ipv6_address& rhs) noexcept -> bool = default;
+
+        friend auto operator<=> (const ipv6_address& lhs, const ipv6_address& rhs) noexcept = default;
+
+        [[nodiscard]]
+        static auto loopback() noexcept -> ipv6_address {
+            ipv6_address result;
+            result.val_[15] = std::byte(1);
+            return result;
+        }
+
+        [[nodiscard]]
+        static auto any() noexcept -> ipv6_address {
+            return {};
+        }
+
+        [[nodiscard]]
+        static auto v4_mapped(const ipv4_address& ipv4) noexcept -> ipv6_address {
+            ipv6_address result;
+            result.val_[10] = result.val_[11] = std::byte(0xff);
+            auto ipv4_bytes = reinterpret_cast<const std::byte*>(&ipv4);
+            for (std::size_t i = 0; i < 4; ++i) result.val_[12 + i] = ipv4_bytes[i];
+            return result;
+        }
+
+    private:
+        alignas(4) std::byte val_[16]{};
+    };
+
+
+    class ip_address {
+    public:
+        ip_address() noexcept : ip_address(ipv4_address::any()) {}
+
+        ip_address(const ipv4_address& v4) noexcept : v4_(v4), version_(4) {}
+
+        ip_address(const ipv6_address& v6) noexcept : v6_(v6), version_(6) {}
+
+        [[nodiscard]]
+        auto is_v4() const noexcept -> bool {
+            return version_ == 4;
+        }
+
+        [[nodiscard]]
+        auto is_v6() const noexcept -> bool {
+            return version_ == 6;
+        }
+
+        [[nodiscard]]
+        auto v4() const noexcept -> const ipv4_address& {
+            return v4_;
+        }
+
+        [[nodiscard]]
+        auto v6() const noexcept -> const ipv6_address& {
+            return v6_;
+        }
+
+        [[nodiscard]]
+        auto to_string() const -> std::string {
+            return is_v4() ? v4_.to_string() : v6_.to_string();
+        }
+
+        friend auto operator== (const ip_address& lhs, const ip_address& rhs) noexcept -> bool {
+            if (lhs.version_ != rhs.version_) return false;
+            if (lhs.is_v4()) return lhs.v4() == rhs.v4();
+            return lhs.v6() == rhs.v6();
+        }
+
+        friend auto operator<=> (const ip_address& lhs, const ip_address& rhs) noexcept -> std::strong_ordering {
+            if (lhs.version_ != rhs.version_) return lhs.version_ <=> rhs.version_;
+            if (lhs.is_v4()) return lhs.v4() <=> rhs.v4();
+            return lhs.v6() <=> rhs.v6();
+        }
+
+    private:
+        union {
+            ipv4_address v4_;
+            ipv6_address v6_;
+        };
+        std::uint8_t version_;
+    };
+
+
+    class endpoint {
+    public:
+        endpoint() = default;
+
+        endpoint(const ipv4_address& ipv4_addr, std::uint16_t port) noexcept : ip_(ipv4_addr), port_(port) {}
+
+        endpoint(const ipv6_address& ipv6_addr, std::uint16_t port) noexcept : ip_(ipv6_addr), port_(port) {}
+
+        [[nodiscard]]
+        auto ip() noexcept -> ip_address& {
+            return ip_;
+        }
+
+        [[nodiscard]]
+        auto ip() const noexcept -> const ip_address& {
+            return ip_;
+        }
+
+        [[nodiscard]]
+        auto port() noexcept -> std::uint16_t& {
+            return port_;
+        }
+
+        [[nodiscard]]
+        auto port() const noexcept -> const std::uint16_t& {
+            return port_;
+        }
+
+        friend auto operator== (const endpoint& lhs, const endpoint& rhs) noexcept -> bool = default;
+
+        friend auto operator<=> (const endpoint& lhs, const endpoint& rhs) noexcept -> std::strong_ordering = default;
+
+        template<std::size_t I> requires (I < 2)
+        decltype(auto) get() noexcept {
+            if constexpr (I == 0) {
+                return ip();
+            }
+            else {
+                return port();
+            }
+        }
+
+        template<std::size_t I> requires (I < 2)
+        decltype(auto) get() const noexcept {
+            if constexpr (I == 0) {
+                return ip();
+            }
+            else {
+                return port();
+            }
+        }
+
+    private:
+        ip_address ip_;
+        std::uint16_t port_{};
+    };
+
+    inline auto reverse_bytes(std::span<std::byte> bytes) noexcept -> void {
+        if (bytes.empty()) [[unlikely]] return;
+        for (std::size_t i = 0, j = bytes.size() - 1; i < j; ++i, --j) {
+            std::swap(bytes[i], bytes[j]);
+        }
+    }
+
+    inline constexpr auto host_to_net = []<typename T> requires std::is_trivially_copyable_v<T> (T in_host) noexcept -> T {
+        static_assert(std::endian::native == std::endian::little or std::endian::native == std::endian::big);
+        if constexpr (std::endian::native == std::endian::little) {
+            (reverse_bytes)(std::span{reinterpret_cast<std::byte*>(&in_host), sizeof(T)});
+        }
+        return in_host;
+    };
+
+    inline constexpr auto net_to_host = []<typename T> requires std::is_trivially_copyable_v<T> (T from_net) noexcept -> T {
+        static_assert(std::endian::native == std::endian::little or std::endian::native == std::endian::big);
+        if constexpr (std::endian::native == std::endian::little) {
+            (reverse_bytes)(std::span{reinterpret_cast<std::byte*>(&from_net), sizeof(T)});
+        }
+        return from_net;
+    };
+}
+
+
+template<>
+struct std::tuple_size<kioto::endpoint> : std::integral_constant<std::size_t, 2> {};
+
+template<std::size_t I>
+struct std::tuple_element<I, kioto::endpoint> {
+    using type = std::conditional_t<I == 0, kioto::ip_address, std::uint16_t>;
+};
+
+#ifdef __cpp_lib_format
+
+template<>
+struct std::formatter<kioto::ipv4_address> : kioto::no_specification_formatter {
+    auto format(const kioto::ipv4_address& ipv4, std::format_context& ctx) const {
+        return std::format_to(ctx.out(), "{}", ipv4.to_string());
+    }
+};
+
+
+template<>
+struct std::formatter<kioto::ipv6_address> : kioto::no_specification_formatter {
+    auto format(const kioto::ipv6_address& ipv6, std::format_context& ctx) const {
+        return std::format_to(ctx.out(), "{}", ipv6.to_string());
+    }
+};
+
+
+template<>
+struct std::formatter<kioto::ip_address> : kioto::no_specification_formatter {
+    auto format(const kioto::ip_address& ip, std::format_context& ctx) const {
+        return std::format_to(ctx.out(), "{}", ip.to_string());
+    }
+};
+
+
+template<>
+struct std::formatter<kioto::endpoint> : kioto::no_specification_formatter {
+    auto format(const kioto::endpoint& ep, std::format_context& ctx) const {
+        return std::format_to(ctx.out(), "{}:{}", ep.ip().to_string(), ep.port());
+    }
+};
+
+#endif
+
+#include <kioto/base/suppress_pop.h> // IWYU pragma: keep

@@ -4,9 +4,9 @@
 // Topology (two runtimes):
 //   send tier -- 4 dedicated flood threads, each blasting connected-UDP datagrams with a raw
 //                blocking send() loop. Raw on purpose: the flood must saturate the receiver's
-//                core WITHOUT itself becoming the bottleneck, and it must keep no coio machinery
-//                on the send side so the receiver's profile is pure coio recv.
-//   recv tier -- ONE coio uring_context, 1 core, draining every flow via an armed multishot recv
+//                core WITHOUT itself becoming the bottleneck, and it must keep no kioto machinery
+//                on the send side so the receiver's profile is pure kioto recv.
+//   recv tier -- ONE kioto uring_context, 1 core, draining every flow via an armed multishot recv
 //                (async_receive_sequence -> IORING_RECV_MULTISHOT into a kernel buf_ring). This
 //                thread is the subject: perf record it and confirm the per-datagram cost is the
 //                kernel + the multishot callback, NOT an op-state alloc / coroutine resume / a
@@ -14,7 +14,7 @@
 //
 // Profile it:
 //   perf record -m 1 -g -e cycles ./build/bench/bench_udp_crosscore --benchmark_filter=recv_flood/512
-//   perf report --tui   # focus the "coio-recv" thread; look for on_completion / the sink, and
+//   perf report --tui   # focus the "kioto-recv" thread; look for on_completion / the sink, and
 //                        # verify NO coroutine_handle::resume / operator new per datagram.
 // (-m 1 works around io_uring vs RLIMIT_MEMLOCK ENOMEM under perf mmap, as with bench_io.)
 #include <netinet/in.h>
@@ -30,14 +30,14 @@
 #include <utility>
 #include <vector>
 #include <benchmark/benchmark.h>
-#include <coio/core.h>
-#include <coio/asyncio/uring_context.h>
-#include <coio/net/socket.h>
-#include <coio/net/udp.h>
+#include <kioto/core.h>
+#include <kioto/io/driver/uring_context.h>
+#include <kioto/net/socket.h>
+#include <kioto/net/udp.h>
 
 namespace {
-    using io_context = coio::uring_context;
-    using udp_socket = coio::udp::socket<io_context::scheduler>;
+    using io_context = kioto::uring_context;
+    using udp_socket = kioto::udp::socket<io_context::scheduler>;
 
     constexpr int N_FLOWS = 8;     // rx sockets the receiver drains concurrently (fixed)
 
@@ -81,7 +81,7 @@ namespace {
     // send(); a full send buffer just blocks/EAGAIN-drops -- we don't care, the receiver counts truth.
     void flood_thread(int cpu, std::vector<int> tx_fds, std::span<const std::byte> payload,
                       const std::atomic<bool>& stop, std::atomic<long>& sent) {
-        ::pthread_setname_np(::pthread_self(), "coio-flood");
+        ::pthread_setname_np(::pthread_self(), "kioto-flood");
         pin_to(cpu);                                  // senders spread across cores 1..N-1; recv owns core 0
         long local = 0;
         while (!stop.load(std::memory_order_relaxed)) {
@@ -95,9 +95,9 @@ namespace {
     // The armed multishot recv for one rx socket: a callback per datagram, no per-op ceremony. Every
     // arrival bumps the (single-threaded, race-free) counter; the target-th arrival trips the stop that
     // releases every armed multishot and lets run() return.
-    auto rx_consumer(udp_socket& rx, coio::buffer_ring& bufs, long& received, long target,
-                     coio::inplace_stop_source& stop) -> io_context::task<> {
-        co_await coio::stop_when(
+    auto rx_consumer(udp_socket& rx, kioto::buffer_ring& bufs, long& received, long target,
+                     kioto::inplace_stop_source& stop) -> io_context::task<> {
+        co_await kioto::stop_when(
             rx.async_receive_sequence(bufs, [&](std::span<std::byte>) noexcept {
                 if (++received == target) stop.request_stop();
             }),
@@ -119,14 +119,14 @@ namespace {
             auto sched = ctx.get_scheduler();
             std::vector<udp_socket> rxs;
             std::vector<::sockaddr_in> rx_addr;
-            std::vector<std::unique_ptr<coio::buffer_ring>> rings;
+            std::vector<std::unique_ptr<kioto::buffer_ring>> rings;
             rxs.reserve(N_FLOWS);
             rx_addr.reserve(N_FLOWS);
             for (int i = 0; i < N_FLOWS; ++i) {
                 auto [rx, addr] = make_rx();
                 rx_addr.push_back(addr);
-                rxs.emplace_back(sched, coio::detail::to_handle(rx));
-                rings.push_back(std::make_unique<coio::buffer_ring>(
+                rxs.emplace_back(sched, kioto::detail::to_handle(rx));
+                rings.push_back(std::make_unique<kioto::buffer_ring>(
                     ctx, 1024u, static_cast<unsigned>(payload_size), i));
             }
 
@@ -146,9 +146,9 @@ namespace {
             }
 
             long received = 0;
-            coio::inplace_stop_source stop;
-            coio::async_scope scope;
-            ::pthread_setname_np(::pthread_self(), "coio-recv");
+            kioto::inplace_stop_source stop;
+            kioto::async_scope scope;
+            ::pthread_setname_np(::pthread_self(), "kioto-recv");
             pin_to(0);                                // receiver owns core 0, uncontended
             state.ResumeTiming();
 
@@ -157,7 +157,7 @@ namespace {
             ctx.run();                                // TIMED: drain `target` datagrams on this one core
 
             state.PauseTiming();
-            coio::this_thread::sync_wait(scope.join());
+            kioto::this_thread::sync_wait(scope.join());
             stop_senders.store(true, std::memory_order_relaxed);
             for (auto& t : senders) t.join();
             for (const int fd : tx_fds) ::close(fd);          // rx fds owned by rxs -> closed on destruction
@@ -179,7 +179,7 @@ namespace {
     }
     // Sweep sender count at a fixed 512B payload to locate the receiver-core ceiling: keep piling on
     // flood threads until recv/s plateaus and loss% climbs -- that knee is the receiver's true ceiling.
-    // Sub-MTU payload: size mostly shifts memcpy, not the coio recv path.
+    // Sub-MTU payload: size mostly shifts memcpy, not the kioto recv path.
     // 2..8 senders scale near-linearly at ~0 loss (flood-limited); the knee is 8->10, where recv/s
     // plateaus ~2.1M and loss jumps to ~20% (receiver core saturated). >10 senders only add contention.
     BENCHMARK(recv_flood)->ArgsProduct({{512}, {2, 4, 6, 8, 10}})->UseRealTime();

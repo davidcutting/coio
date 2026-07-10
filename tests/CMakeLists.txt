@@ -1,6 +1,6 @@
-project(coio-tests)
+project(kioto-tests)
 
-file(GLOB COIO_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/test_*.cpp")
+file(GLOB KIOTO_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/test_*.cpp")
 
 CPMFindPackage(
     NAME doctest
@@ -10,33 +10,33 @@ CPMFindPackage(
     SYSTEM YES
 )
 
-foreach(COIO_TEST_SOURCE IN LISTS COIO_TEST_SOURCES)
-    get_filename_component(COIO_TEST_NAME "${COIO_TEST_SOURCE}" NAME_WE)
+foreach(KIOTO_TEST_SOURCE IN LISTS KIOTO_TEST_SOURCES)
+    get_filename_component(KIOTO_TEST_NAME "${KIOTO_TEST_SOURCE}" NAME_WE)
 
     add_executable(
-        ${COIO_TEST_NAME}
+        ${KIOTO_TEST_NAME}
     )
 
     target_sources(
-        ${COIO_TEST_NAME}
+        ${KIOTO_TEST_NAME}
         PRIVATE
-        ${COIO_TEST_SOURCE}
+        ${KIOTO_TEST_SOURCE}
     )
 
     target_link_libraries(
-        ${COIO_TEST_NAME}
+        ${KIOTO_TEST_NAME}
         PRIVATE
         doctest::doctest
-        coio
+        kioto
     )
     target_compile_definitions(
-        ${COIO_TEST_NAME}
+        ${KIOTO_TEST_NAME}
         PRIVATE
         -DDOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
     )
 
     add_test(
-        NAME ${COIO_TEST_NAME}
-        COMMAND $<TARGET_FILE:${COIO_TEST_NAME}>
+        NAME ${KIOTO_TEST_NAME}
+        COMMAND $<TARGET_FILE:${KIOTO_TEST_NAME}>
     )
 endforeach()

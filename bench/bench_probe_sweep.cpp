@@ -15,15 +15,15 @@
 #include <memory>
 #include <optional>
 #include <benchmark/benchmark.h>
-#include <coio/core.h>
-#include <coio/asyncio/uring_context.h>
-#include <coio/metrics.h>
-#include <coio/metrics_reporter.h>
-#include <coio/runtime.h>
+#include <kioto/core.h>
+#include <kioto/io/driver/uring_context.h>
+#include <kioto/runtime/metrics.h>
+#include <kioto/runtime/metrics_reporter.h>
+#include <kioto/runtime/runtime.h>
 
 namespace {
-    using metered_uring = coio::basic_executor<coio::counting_metrics, coio::uring_driver>;
-    using metered_runtime = coio::basic_runtime<metered_uring>;
+    using metered_uring = kioto::basic_executor<kioto::counting_metrics, kioto::uring_driver>;
+    using metered_runtime = kioto::basic_runtime<metered_uring>;
 
     auto us(std::chrono::nanoseconds d) -> double { return std::chrono::duration<double, std::micro>(d).count(); }
 
@@ -50,21 +50,21 @@ namespace {
                  std::chrono::microseconds probe_interval, int max_in_flight) -> point {
         auto rt = make_optional_runtime();
         std::atomic<bool> running{true};
-        coio::runtime_report rep;
+        kioto::runtime_report rep;
         {
-            coio::metrics_reporter reporter{*rt};
+            kioto::metrics_reporter reporter{*rt};
             reporter.probe_scheduling(probe_interval, max_in_flight);
             auto sched = rt->pick_scheduler();
             // Bootstrap the D pumps FROM the worker (local spawns) so setup is cheap and the backlog is local.
-            rt->spawn_on(sched, coio::just() | coio::let_value([rt = &*rt, sched, running = &running, depth] {
+            rt->spawn_on(sched, kioto::just() | kioto::let_value([rt = &*rt, sched, running = &running, depth] {
                 for (long i = 0; i < depth; ++i) rt->spawn_on(sched, pump(rt, sched, running));
-                return coio::just();
+                return kioto::just();
             }));
-            coio::this_thread::sleep_for(window);   // let it reach steady state + gather probes
+            kioto::this_thread::sleep_for(window);   // let it reach steady state + gather probes
             rep = reporter.tick();                   // samples/latency over the window
             running.store(false, std::memory_order_relaxed);
         }   // reporter drained here (backlog now shrinking -> quick)
-        coio::this_thread::sync_wait(rt->join());
+        kioto::this_thread::sync_wait(rt->join());
         const auto& l = rep.scheduling_latency;
         return {depth, l.count, us(l.p50), us(l.p99)};
     }

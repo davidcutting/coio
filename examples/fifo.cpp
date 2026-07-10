@@ -1,7 +1,7 @@
 #include <thread>
-#include <coio/core.h>
-#include <coio/execution_context.h>
-#include <coio/utils/fifo.h>
+#include <kioto/core.h>
+#include <kioto/io/execution_context.h>
+#include <kioto/base/fifo.h>
 #include "common.h"
 
 namespace {
@@ -24,23 +24,23 @@ namespace {
         }
 
     private:
-        coio::time_loop loop;
+        kioto::time_loop loop;
         std::jthread thrd;
-        coio::work_guard<coio::time_loop> _{loop};
+        kioto::work_guard<kioto::time_loop> _{loop};
     };
 }
 
 auto main() -> int {
     worker workers[6]{1, 2, 3, 4, 5, 6};
-    coio::fifo<std::string> channel;
-    auto writer = [&](std::string_view name, std::initializer_list<std::string_view> datum) -> coio::task<> {
+    kioto::fifo<std::string> channel;
+    auto writer = [&](std::string_view name, std::initializer_list<std::string_view> datum) -> kioto::task<> {
         for (auto str : datum) {
             ::debug("{} writes {}", name, str);
             co_await channel.async_emplace(str);
         }
     };
 
-    auto reader = [&](std::string_view name) -> coio::task<> {
+    auto reader = [&](std::string_view name) -> kioto::task<> {
         while (true) {
             auto str = co_await channel.async_pop();
             ::debug("{} reads {}", name, str);
@@ -48,15 +48,15 @@ auto main() -> int {
         }
     };
 
-    auto start_writer = [&writer](coio::scheduler auto sched, std::string_view name, std::initializer_list<std::string_view> datum) {
-        return coio::starts_on(sched, writer(name, datum));
+    auto start_writer = [&writer](kioto::scheduler auto sched, std::string_view name, std::initializer_list<std::string_view> datum) {
+        return kioto::starts_on(sched, writer(name, datum));
     };
 
-    auto start_reader = [&reader](coio::scheduler auto sched, std::string_view name) {
-        return coio::starts_on(sched, reader(name));
+    auto start_reader = [&reader](kioto::scheduler auto sched, std::string_view name) {
+        return kioto::starts_on(sched, reader(name));
     };
 
-    coio::this_thread::sync_wait(coio::when_all(
+    kioto::this_thread::sync_wait(kioto::when_all(
         start_writer(workers[0].scheduler(), "writer-1", {"1#1", "1#2", "1#3", "1#4", "bye", "bye"}),
         start_writer(workers[1].scheduler(), "writer-2", {"2#1", "2#2", "2#3", "2#4", "2#5", "2#6", "2#7", "bye", "bye"}),
         start_reader(workers[2].scheduler(), "reader-1"),

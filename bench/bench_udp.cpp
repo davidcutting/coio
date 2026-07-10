@@ -1,4 +1,4 @@
-// UDP throughput ("hose") microbenchmark for coio, on the single-owner uring reactor.
+// UDP throughput ("hose") microbenchmark for kioto, on the single-owner uring reactor.
 //
 //   udp_hose -- blast datagrams over connected localhost UDP and measure packets/s + bytes/s.
 //               Depth D is modelled as D INDEPENDENT socket pairs (the datagram socket API allows
@@ -20,15 +20,15 @@
 #include <system_error>
 #include <vector>
 #include <benchmark/benchmark.h>
-#include <coio/core.h>
-#include <coio/asyncio/io.h>
-#include <coio/asyncio/uring_context.h>
-#include <coio/net/socket.h>
-#include <coio/net/udp.h>
+#include <kioto/core.h>
+#include <kioto/io/io.h>
+#include <kioto/io/driver/uring_context.h>
+#include <kioto/net/socket.h>
+#include <kioto/net/udp.h>
 
 namespace {
-    using io_context = coio::uring_context;
-    using udp_socket = coio::udp::socket<io_context::scheduler>;
+    using io_context = kioto::uring_context;
+    using udp_socket = kioto::udp::socket<io_context::scheduler>;
 
     struct flow {
         udp_socket tx;
@@ -93,10 +93,10 @@ namespace {
             std::vector<flow> flows;
             flows.reserve(static_cast<std::size_t>(depth));
             for (long i = 0; i < depth; ++i) {
-                udp_socket tx{sched, coio::udp::v4()};
-                udp_socket rx{sched, coio::udp::v4()};
-                tx.bind(coio::endpoint{coio::ipv4_address::loopback(), 0});
-                rx.bind(coio::endpoint{coio::ipv4_address::loopback(), 0});
+                udp_socket tx{sched, kioto::udp::v4()};
+                udp_socket rx{sched, kioto::udp::v4()};
+                tx.bind(kioto::endpoint{kioto::ipv4_address::loopback(), 0});
+                rx.bind(kioto::endpoint{kioto::ipv4_address::loopback(), 0});
                 tx.set_option(udp_socket::send_buffer_size{sock_buf});
                 rx.set_option(udp_socket::receive_buffer_size{sock_buf});
                 // Connect both ends so async_send/async_receive skip the per-packet address.
@@ -108,7 +108,7 @@ namespace {
 
             long received = 0;
             long senders_left = depth;
-            coio::async_scope scope;
+            kioto::async_scope scope;
             state.ResumeTiming();
 
             for (auto& f : flows) scope.spawn_on(sched, receiver(f.rx, f.rxbuf, received));
@@ -118,14 +118,14 @@ namespace {
             ctx->run(); // timed region: drive every send + receive to completion
 
             state.PauseTiming();
-            coio::this_thread::sync_wait(scope.join());
+            kioto::this_thread::sync_wait(scope.join());
             total_received += received;
             flows.clear();
             ctx.reset();
             state.ResumeTiming();
         }
 
-        // Headline items/s + bytes/s = SEND rate: how fast coio hoses datagrams out (clean, no
+        // Headline items/s + bytes/s = SEND rate: how fast kioto hoses datagrams out (clean, no
         // receiver-side loopback artifacts). recv/s = delivered rate; loss% = fraction the loopback
         // dropped under the flood. Metrics set once, over the whole run.
         const long total_sent = per_flow * depth * state.iterations();
@@ -144,15 +144,15 @@ namespace {
     // Same hose, but each rx drains via ONE armed IORING_RECV_MULTISHOT (callback per datagram) instead
     // of a per-op async_receive loop. Head-to-head with udp_hose: does amortizing the per-datagram
     // op-state + coroutine across one armed op raise delivered PPS?
-    auto ms_consumer(udp_socket& rx, coio::buffer_ring& bufs, long& received,
-                     coio::inplace_stop_token tok) -> io_context::task<> {
-        co_await coio::stop_when(
+    auto ms_consumer(udp_socket& rx, kioto::buffer_ring& bufs, long& received,
+                     kioto::inplace_stop_token tok) -> io_context::task<> {
+        co_await kioto::stop_when(
             rx.async_receive_sequence(bufs, [&](std::span<std::byte>) noexcept { ++received; }), tok);
     }
 
     auto ms_sender(io_context::scheduler sched, udp_socket& tx, std::span<const std::byte> payload,
                    long count, long& senders_left, const long& received,
-                   coio::inplace_stop_source& stop) -> io_context::task<> {
+                   kioto::inplace_stop_source& stop) -> io_context::task<> {
         for (long i = 0; i < count; ++i) co_await tx.async_send(payload);
         if (--senders_left == 0) {
             long last = -1;
@@ -177,26 +177,26 @@ namespace {
             auto sched = ctx->get_scheduler();
 
             std::vector<flow> flows;
-            std::vector<std::unique_ptr<coio::buffer_ring>> rings;
+            std::vector<std::unique_ptr<kioto::buffer_ring>> rings;
             flows.reserve(static_cast<std::size_t>(depth));
             for (long i = 0; i < depth; ++i) {
-                udp_socket tx{sched, coio::udp::v4()};
-                udp_socket rx{sched, coio::udp::v4()};
-                tx.bind(coio::endpoint{coio::ipv4_address::loopback(), 0});
-                rx.bind(coio::endpoint{coio::ipv4_address::loopback(), 0});
+                udp_socket tx{sched, kioto::udp::v4()};
+                udp_socket rx{sched, kioto::udp::v4()};
+                tx.bind(kioto::endpoint{kioto::ipv4_address::loopback(), 0});
+                rx.bind(kioto::endpoint{kioto::ipv4_address::loopback(), 0});
                 tx.set_option(udp_socket::send_buffer_size{sock_buf});
                 rx.set_option(udp_socket::receive_buffer_size{sock_buf});
                 tx.connect(rx.local_endpoint());
                 rx.connect(tx.local_endpoint());
-                rings.push_back(std::make_unique<coio::buffer_ring>(*ctx, 1024u,
+                rings.push_back(std::make_unique<kioto::buffer_ring>(*ctx, 1024u,
                     static_cast<unsigned>(payload_size), static_cast<int>(i)));
                 flows.push_back(flow{std::move(tx), std::move(rx), {}});
             }
 
             long received = 0;
             long senders_left = depth;
-            coio::inplace_stop_source stop;
-            coio::async_scope scope;
+            kioto::inplace_stop_source stop;
+            kioto::async_scope scope;
             state.ResumeTiming();
 
             for (long i = 0; i < depth; ++i) {
@@ -208,7 +208,7 @@ namespace {
             ctx->run();
 
             state.PauseTiming();
-            coio::this_thread::sync_wait(scope.join());
+            kioto::this_thread::sync_wait(scope.join());
             total_received += received;
             flows.clear();
             rings.clear();

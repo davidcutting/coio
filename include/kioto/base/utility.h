@@ -1,0 +1,58 @@
+﻿#pragma once
+#include <utility>
+#include <kioto/base/config.h>
+#include <kioto/base/type_traits.h> // IWYU pragma: keep
+
+namespace kioto {
+#ifdef __cpp_lib_unreachable
+    using std::unreachable;
+#else
+    [[noreturn]]
+    KIOTO_ALWAYS_INLINE auto unreachable() -> void {
+#if defined(_MSC_VER) && !defined(__clang__)
+        __assume(false);
+#else
+        __builtin_unreachable();
+#endif
+    }
+#endif
+
+    template<typename E> requires std::is_enum_v<E>
+    KIOTO_ALWAYS_INLINE constexpr auto to_underlying(E e) noexcept -> std::underlying_type_t<E> {
+        return static_cast<std::underlying_type_t<E>>(e);
+    }
+
+    template<typename T>
+    KIOTO_ALWAYS_INLINE constexpr auto to_signed(T x) noexcept -> std::make_signed_t<T> {
+        return static_cast<std::make_signed_t<T>>(x);
+    }
+
+    template<typename T>
+    KIOTO_ALWAYS_INLINE constexpr auto to_unsigned(T x) noexcept -> std::make_unsigned_t<T> {
+        return static_cast<std::make_unsigned_t<T>>(x);
+    }
+
+#ifdef __cpp_lib_forward_like
+    using std::forward_like;
+#else
+    template<typename T, typename U>
+    KIOTO_ALWAYS_INLINE constexpr auto&& forward_like(U&& x) noexcept {
+        if constexpr (std::is_lvalue_reference_v<T>) {
+            if constexpr (std::is_const_v<std::remove_reference_t<T>>) {
+                return std::as_const(x);
+            }
+            else {
+                return static_cast<U&>(x);
+            }
+        }
+        else {
+            if constexpr (std::is_const_v<std::remove_reference_t<T>>) {
+                return std::move(std::as_const(x));
+            }
+            else {
+                return std::move(x); // NOLINT(bugprone-move-forwarding-reference)
+            }
+        }
+    }
+#endif
+}

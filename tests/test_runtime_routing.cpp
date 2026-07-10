@@ -2,29 +2,29 @@
 // not just the first.
 #include <atomic>
 #include <doctest/doctest.h>
-#include <coio/core.h>
-#include <coio/init.h>
+#include <kioto/core.h>
+#include <kioto/runtime/init.h>
 
 // Uses io_uring pools explicitly (and includes its header, which #errors without liburing) — skip where
 // io_uring is unavailable. The p2c routing itself is backend-agnostic (see test_heterogeneous_runtime).
-#if COIO_HAS_IO_URING
-#include <coio/asyncio/uring_context.h>
+#if KIOTO_HAS_IO_URING
+#include <kioto/io/driver/uring_context.h>
 
 TEST_CASE("spawn_on<Cap> distributes across multiple eligible pools (power-of-two-choices)") {
     std::atomic<int> ok{0};
     std::size_t to0 = 0, to1 = 0;
     {
         // two pools, BOTH provide io -> spawn_on<io> must not dump everything on pool 0
-        auto rt = coio::make_runtime(
-            coio::pool(2, coio::driver_init<coio::uring_driver>(256u)),
-            coio::pool(2, coio::driver_init<coio::uring_driver>(256u))
+        auto rt = kioto::make_runtime(
+            kioto::pool(2, kioto::driver_init<kioto::uring_driver>(256u)),
+            kioto::pool(2, kioto::driver_init<kioto::uring_driver>(256u))
         );
         constexpr int n = 60;
         for (int i = 0; i < n; ++i)
-            rt.spawn_on<coio::capability::io>(coio::just() | coio::then([&] { ok.fetch_add(1, std::memory_order_relaxed); }));
+            rt.spawn_on<kioto::capability::io>(kioto::just() | kioto::then([&] { ok.fetch_add(1, std::memory_order_relaxed); }));
         to0 = rt.spawns_routed_to<0>();
         to1 = rt.spawns_routed_to<1>();
-        coio::this_thread::sync_wait(rt.join());
+        kioto::this_thread::sync_wait(rt.join());
         CHECK(ok.load() == n);
         CHECK(to0 + to1 == n);         // every spawn was routed to some eligible pool
         CHECK(to0 > 0);                // ...and BOTH pools received work (not just the first)
@@ -36,15 +36,15 @@ TEST_CASE("spawn_on<Cap> with a single eligible pool still routes there (fast pa
     std::atomic<int> ok{0};
     {
         // one io pool + one timer-only pool: io is served ONLY by pool 0
-        auto rt = coio::make_runtime(
-            coio::pool(2, coio::driver_init<coio::uring_driver>(256u)),
-            coio::pool(1, coio::driver_init<coio::timer_driver>())
+        auto rt = kioto::make_runtime(
+            kioto::pool(2, kioto::driver_init<kioto::uring_driver>(256u)),
+            kioto::pool(1, kioto::driver_init<kioto::timer_driver>())
         );
         for (int i = 0; i < 8; ++i)
-            rt.spawn_on<coio::capability::io>(coio::just() | coio::then([&] { ok.fetch_add(1, std::memory_order_relaxed); }));
+            rt.spawn_on<kioto::capability::io>(kioto::just() | kioto::then([&] { ok.fetch_add(1, std::memory_order_relaxed); }));
         CHECK(rt.spawns_routed_to<0>() == 8);   // all io -> the only io-capable pool
         CHECK(rt.spawns_routed_to<1>() == 0);
-        coio::this_thread::sync_wait(rt.join());
+        kioto::this_thread::sync_wait(rt.join());
     }
     CHECK(ok.load() == 8);
 }

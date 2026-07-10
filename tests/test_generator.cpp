@@ -1,25 +1,25 @@
 #include <array>
 #include <vector>
 #include <doctest/doctest.h>
-#include <coio/generator.h>
+#include <kioto/exec/generator.h>
 
 namespace {
-auto iota(int n) -> coio::generator<int> {
+auto iota(int n) -> kioto::generator<int> {
     for (int i = 0; i < n; ++i) {
         co_yield i;
     }
 }
 
-auto flattened_values() -> coio::generator<const int&> {
+auto flattened_values() -> kioto::generator<const int&> {
     std::array<int, 1> first{1};
     for (const int& value : first) {
         co_yield value;
     }
 
     std::array<int, 2> middle{2, 3};
-    co_yield coio::elements_of{middle};
+    co_yield kioto::elements_of{middle};
 
-    co_yield coio::elements_of{[]() -> coio::generator<const int&> {
+    co_yield kioto::elements_of{[]() -> kioto::generator<const int&> {
         std::array<int, 2> tail{4, 5};
         for (const int& value : tail) {
             co_yield value;
@@ -27,7 +27,7 @@ auto flattened_values() -> coio::generator<const int&> {
     }()};
 }
 
-auto mutable_refs(std::vector<int>& values) -> coio::generator<int&> {
+auto mutable_refs(std::vector<int>& values) -> kioto::generator<int&> {
     for (auto& value : values) {
         co_yield value;
     }

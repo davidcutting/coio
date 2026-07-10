@@ -1,7 +1,7 @@
 #include <array>
 #include <vector>
 #include <doctest/doctest.h>
-#include <coio/detail/intrusive_list.h>
+#include <kioto/base/intrusive_list.h>
 
 namespace {
     struct item {
@@ -19,7 +19,7 @@ namespace {
 }
 
 TEST_CASE("intrusive_list pushes and pops in FIFO order") {
-    coio::detail::intrusive_list<item> list{&item::next};
+    kioto::detail::intrusive_list<item> list{&item::next};
     item first{1};
     item second{2};
     item third{3};
@@ -46,7 +46,7 @@ TEST_CASE("intrusive_list pushes and pops in FIFO order") {
 }
 
 TEST_CASE("intrusive_list appends a chain and detaches it") {
-    coio::detail::intrusive_list<item> list{&item::next};
+    kioto::detail::intrusive_list<item> list{&item::next};
     std::array items{item{1}, item{2}, item{3}, item{4}};
     items[0].next = &items[1];
     items[1].next = &items[2];

@@ -4,10 +4,10 @@
 #include <memory>
 #include <thread>
 #include <doctest/doctest.h>
-#include <coio/core.h>
-#include <coio/runtime.h>
-#include <coio/asyncio/io.h>
-#include <coio/asyncio/pipe.h>
+#include <kioto/core.h>
+#include <kioto/runtime/runtime.h>
+#include <kioto/io/io.h>
+#include <kioto/io/pipe.h>
 #include "io_contexts.h"
 
 using namespace std::chrono_literals;
@@ -15,12 +15,12 @@ using namespace std::chrono_literals;
 namespace {
     template<typename Sched>
     auto pinned_blocking_read(Sched ws, std::atomic<int>* started, std::atomic<int>* cancelled)
-        -> coio::task<> {
-        auto [reader, writer] = coio::make_pipe(ws);
+        -> kioto::task<> {
+        auto [reader, writer] = kioto::make_pipe(ws);
         char buf[16];
         started->fetch_add(1, std::memory_order_relaxed);
-        auto result = co_await coio::execution::stopped_as_optional(
-            reader.async_read_some(coio::as_writable_bytes(buf))
+        auto result = co_await kioto::execution::stopped_as_optional(
+            reader.async_read_some(kioto::as_writable_bytes(buf))
         );
         if (not result.has_value()) cancelled->fetch_add(1, std::memory_order_relaxed);
         static_cast<void>(writer);
@@ -30,7 +30,7 @@ namespace {
     auto spawn_pinned_reads(Runtime& rt, std::atomic<int>& started, std::atomic<int>& cancelled, int n)
         -> void {
         for (int i = 0; i < n; ++i) {
-            rt.spawn(coio::just() | coio::then([&rt, &started, &cancelled] {
+            rt.spawn(kioto::just() | kioto::then([&rt, &started, &cancelled] {
                 auto ws = *Runtime::current_scheduler();
                 rt.spawn_on(ws, pinned_blocking_read(ws, &started, &cancelled));
             }));
@@ -53,20 +53,20 @@ namespace {
     }
 }
 
-#if COIO_HAS_IO_URING
+#if KIOTO_HAS_IO_URING
 TEST_CASE("uring runtime: pinned in-flight reads are cancelled cross-thread at teardown") {
-    run_teardown_cancel([] { return coio::uring_runtime{3}; });
+    run_teardown_cancel([] { return kioto::uring_runtime{3}; });
 }
 #endif
 
-#if COIO_HAS_EPOLL
+#if KIOTO_HAS_EPOLL
 TEST_CASE("epoll runtime: pinned in-flight reads are cancelled cross-thread at teardown") {
-    run_teardown_cancel([] { return coio_test::make_runtime<coio::epoll_context>(3); });
+    run_teardown_cancel([] { return kioto_test::make_runtime<kioto::epoll_context>(3); });
 }
 #endif
 
-#if COIO_HAS_IOCP
+#if KIOTO_HAS_IOCP
 TEST_CASE("iocp runtime: pinned in-flight reads are cancelled cross-thread at teardown") {
-    run_teardown_cancel([] { return coio_test::make_runtime<coio::iocp_context>(3); });
+    run_teardown_cancel([] { return kioto_test::make_runtime<kioto::iocp_context>(3); });
 }
 #endif

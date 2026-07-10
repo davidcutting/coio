@@ -1,5 +1,5 @@
 {
-  description = "Coio Development";
+  description = "Kioto Development";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

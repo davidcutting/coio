@@ -1,4 +1,4 @@
-project(coio-examples)
+project(kioto-examples)
 
 file(GLOB EXAMPLE_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/*.cpp")
 
@@ -13,7 +13,7 @@ foreach(EXAMPLE_FILE ${EXAMPLE_FILES})
     target_link_libraries(
         example-${EXAMPLE_FILE_NAME}
         PRIVATE
-        coio
+        kioto
     )
 endforeach()
 

@@ -1,25 +1,25 @@
-#include <coio/core.h>
-#include <coio/asyncio/io.h>
-#include <coio/net/socket.h>
-#include <coio/net/tcp.h>
-#include <coio/utils/flat_buffer.h>
+#include <kioto/core.h>
+#include <kioto/io/io.h>
+#include <kioto/net/socket.h>
+#include <kioto/net/tcp.h>
+#include <kioto/base/flat_buffer.h>
 #include "common.h"
 
-#if COIO_OS_LINUX
-#include <coio/asyncio/epoll_context.h>
-using io_context = coio::epoll_context;
-#elif COIO_OS_WINDOWS
-#include <coio/asyncio/iocp_context.h>
-using io_context = coio::iocp_context;
+#if KIOTO_OS_LINUX
+#include <kioto/io/driver/epoll_context.h>
+using io_context = kioto::epoll_context;
+#elif KIOTO_OS_WINDOWS
+#include <kioto/io/driver/iocp_context.h>
+using io_context = kioto::iocp_context;
 #endif
 
-using tcp_socket = coio::tcp::socket<io_context::scheduler>;
-using tcp_acceptor = coio::tcp::acceptor<io_context::scheduler>;
+using tcp_socket = kioto::tcp::socket<io_context::scheduler>;
+using tcp_acceptor = kioto::tcp::acceptor<io_context::scheduler>;
 
 auto handle_connection() -> io_context::task<> try {
-    io_context::scheduler sched = co_await coio::read_scheduler();
+    io_context::scheduler sched = co_await kioto::read_scheduler();
     tcp_socket socket{sched};
-    co_await socket.async_connect({coio::ipv4_address::loopback(), 8086});
+    co_await socket.async_connect({kioto::ipv4_address::loopback(), 8086});
     ::println("local endpoint: {}", socket.local_endpoint());
     ::println("input messages to send to echo server (type 'exit' or 'quit' to quit):");
     while (true) {
@@ -28,10 +28,10 @@ auto handle_connection() -> io_context::task<> try {
         std::getline(std::cin, content);
         if (content.empty()) continue;
         if (content == "exit" or content == "quit") break;
-        co_await (coio::async_write(socket, coio::as_bytes(content)) | as_throwing);
+        co_await (kioto::async_write(socket, kioto::as_bytes(content)) | as_throwing);
         std::size_t content_length = content.size();
-        coio::flat_buffer buffer;
-        co_await (coio::async_read(socket, buffer, content_length) | as_throwing);
+        kioto::flat_buffer buffer;
+        co_await (kioto::async_read(socket, buffer, content_length) | as_throwing);
         const auto buffer_data = buffer.data();
         ::println("-- {}", std::string_view{reinterpret_cast<const char*>(buffer_data.data()), buffer_data.size()});
         buffer.consume(content_length);
@@ -43,8 +43,8 @@ catch (const std::exception& e) {
 
 auto main() -> int {
     io_context context;
-    coio::async_scope scope;
+    kioto::async_scope scope;
     scope.spawn_on(context.get_scheduler(), handle_connection());
     context.run();
-    coio::this_thread::sync_wait(scope.join());
+    kioto::this_thread::sync_wait(scope.join());
 }

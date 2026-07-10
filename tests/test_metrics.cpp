@@ -4,20 +4,20 @@
 #include <numeric>
 #include <type_traits>
 #include <doctest/doctest.h>
-#include <coio/core.h>
-#include <coio/drivers.h>
-#include <coio/metrics.h>
-#include <coio/metrics_reporter.h>
-#include <coio/runtime.h>
-#include <coio/time_loop.h>
+#include <kioto/core.h>
+#include <kioto/io/driver/drivers.h>
+#include <kioto/runtime/metrics.h>
+#include <kioto/runtime/metrics_reporter.h>
+#include <kioto/runtime/runtime.h>
+#include <kioto/io/time_loop.h>
 
 using namespace std::chrono_literals;
 
 // The default policy must cost nothing — empty type, so [[no_unique_address]] makes it zero-size.
-static_assert(std::is_empty_v<coio::no_metrics>, "no_metrics must be zero-size (zero-cost default)");
+static_assert(std::is_empty_v<kioto::no_metrics>, "no_metrics must be zero-size (zero-cost default)");
 
 namespace {
-    using metered = coio::basic_executor<coio::counting_metrics, coio::timer_driver>;
+    using metered = kioto::basic_executor<kioto::counting_metrics, kioto::timer_driver>;
 
     auto sleeper(metered::scheduler sched) -> metered::task<> {
         co_await sched.schedule_after(1ms);
@@ -27,11 +27,11 @@ namespace {
 TEST_CASE("counting_metrics records run-loop activity") {
     metered ex;                              // a metered time_loop worker
     auto sched = ex.get_scheduler();
-    coio::async_scope scope;
+    kioto::async_scope scope;
     for (int i = 0; i < 8; ++i)
         scope.spawn_on(sched, sleeper(sched));   // spawned from THIS (non-owner) thread -> cross-thread submits
     ex.run();                                // drives the sleepers to completion, then exits (work_count == 0)
-    coio::this_thread::sync_wait(scope.join());
+    kioto::this_thread::sync_wait(scope.join());
 
     const auto s = ex.metrics().snapshot();
     CHECK(s.turns > 0);
@@ -43,15 +43,15 @@ TEST_CASE("counting_metrics records run-loop activity") {
 
 TEST_CASE("basic_runtime aggregates per-worker metrics") {
     // A metered homogeneous runtime: every worker carries counting_metrics.
-    using metered_worker = coio::basic_executor<coio::counting_metrics, coio::timer_driver>;
-    coio::basic_runtime<metered_worker> rt{4};
+    using metered_worker = kioto::basic_executor<kioto::counting_metrics, kioto::timer_driver>;
+    kioto::basic_runtime<metered_worker> rt{4};
     {
-        coio::async_scope scope;
+        kioto::async_scope scope;
         for (int i = 0; i < 32; ++i) {
             auto sched = rt.pick_scheduler();
             scope.spawn_on(sched, sleeper(sched));
         }
-        coio::this_thread::sync_wait(scope.join());
+        kioto::this_thread::sync_wait(scope.join());
     }
 
     const auto per_worker = rt.collect_metrics();
@@ -60,22 +60,22 @@ TEST_CASE("basic_runtime aggregates per-worker metrics") {
     const auto total = rt.aggregate_metrics();
     CHECK(total.ops_run >= 32);                          // all 32 sleepers completed somewhere
     // aggregate == field-wise sum of the per-worker snapshots
-    const auto summed = std::accumulate(per_worker.begin(), per_worker.end(), coio::executor_stats{});
+    const auto summed = std::accumulate(per_worker.begin(), per_worker.end(), kioto::executor_stats{});
     CHECK(summed.ops_run == total.ops_run);
     CHECK(summed.turns == total.turns);
 }
 
 TEST_CASE("runtime builder threads a metrics policy through every worker") {
-    auto rt = coio::runtime::builder()
-        .metrics<coio::counting_metrics>()
-        .pool(2).capability<coio::capability::timer>()
+    auto rt = kioto::runtime::builder()
+        .metrics<kioto::counting_metrics>()
+        .pool(2).capability<kioto::capability::timer>()
         .build();
     CHECK(rt.size() == 2);
 
     std::atomic<int> ran{0};
     for (int i = 0; i < 16; ++i)
-        rt.spawn_on<coio::capability::timer>(coio::just() | coio::then([&] { ran.fetch_add(1); }));
-    coio::this_thread::sync_wait(rt.join());
+        rt.spawn_on<kioto::capability::timer>(kioto::just() | kioto::then([&] { ran.fetch_add(1); }));
+    kioto::this_thread::sync_wait(rt.join());
     CHECK(ran.load() == 16);
 
     // Every worker was built with counting_metrics -> the runtime can now aggregate.
@@ -87,17 +87,17 @@ TEST_CASE("runtime builder threads a metrics policy through every worker") {
 }
 
 TEST_CASE("metrics_reporter diffs snapshots into rates") {
-    using metered_worker = coio::basic_executor<coio::counting_metrics, coio::timer_driver>;
-    coio::basic_runtime<metered_worker> rt{2};
+    using metered_worker = kioto::basic_executor<kioto::counting_metrics, kioto::timer_driver>;
+    kioto::basic_runtime<metered_worker> rt{2};
 
-    coio::metrics_reporter reporter{rt};   // baseline snapshot taken here (before any work)
+    kioto::metrics_reporter reporter{rt};   // baseline snapshot taken here (before any work)
     {
-        coio::async_scope scope;
+        kioto::async_scope scope;
         for (int i = 0; i < 20; ++i) {
             auto sched = rt.pick_scheduler();
             scope.spawn_on(sched, sleeper(sched));
         }
-        coio::this_thread::sync_wait(scope.join());
+        kioto::this_thread::sync_wait(scope.join());
     }
 
     const auto rep = reporter.tick();      // interval = construction -> now, with 20 ops of work in it
@@ -116,26 +116,26 @@ TEST_CASE("metrics_reporter diffs snapshots into rates") {
 }
 
 TEST_CASE("metrics_reporter run_every drives a sink off a side thread") {
-    using metered_worker = coio::basic_executor<coio::counting_metrics, coio::timer_driver>;
-    coio::basic_runtime<metered_worker> rt{2};
+    using metered_worker = kioto::basic_executor<kioto::counting_metrics, kioto::timer_driver>;
+    kioto::basic_runtime<metered_worker> rt{2};
 
     std::atomic<int> reports{0};
     std::atomic<std::size_t> last_ops{0};
-    coio::metrics_reporter reporter{rt};
-    reporter.run_every(5ms, [&](const coio::runtime_report& r) {
+    kioto::metrics_reporter reporter{rt};
+    reporter.run_every(5ms, [&](const kioto::runtime_report& r) {
         reports.fetch_add(1, std::memory_order_relaxed);
         last_ops.store(r.aggregate.ops_run, std::memory_order_relaxed);
     });
 
     {
-        coio::async_scope scope;
+        kioto::async_scope scope;
         for (int i = 0; i < 20; ++i) {
             auto sched = rt.pick_scheduler();
             scope.spawn_on(sched, sleeper(sched));
         }
-        coio::this_thread::sync_wait(scope.join());
+        kioto::this_thread::sync_wait(scope.join());
     }
-    coio::this_thread::sleep_for(30ms);   // let a few ticks fire
+    kioto::this_thread::sleep_for(30ms);   // let a few ticks fire
     reporter.stop();                       // prompt, interruptible
 
     CHECK(reports.load() >= 1);            // the sink was called
@@ -143,7 +143,7 @@ TEST_CASE("metrics_reporter run_every drives a sink off a side thread") {
 }
 
 TEST_CASE("latency_histogram percentiles") {
-    coio::latency_histogram h;
+    kioto::latency_histogram h;
     for (int i = 0; i < 100; ++i) h.record(std::chrono::microseconds{1});   // ~1024ns -> bucket 10
     h.record(std::chrono::milliseconds{1});                                  // a single tail sample
     const auto s = h.snapshot();
@@ -156,14 +156,14 @@ TEST_CASE("latency_histogram percentiles") {
 }
 
 TEST_CASE("metrics_reporter probes submit->run scheduling latency") {
-    using metered_worker = coio::basic_executor<coio::counting_metrics, coio::timer_driver>;
-    coio::basic_runtime<metered_worker> rt{2};
+    using metered_worker = kioto::basic_executor<kioto::counting_metrics, kioto::timer_driver>;
+    kioto::basic_runtime<metered_worker> rt{2};
 
-    coio::metrics_reporter reporter{rt};
+    kioto::metrics_reporter reporter{rt};
     reporter.probe_scheduling(200us);      // start the probe thread
 
     // Let probes accumulate against a mostly-idle runtime (near-zero scheduling delay expected).
-    coio::this_thread::sleep_for(60ms);
+    kioto::this_thread::sleep_for(60ms);
 
     const auto rep = reporter.tick();
     CHECK(rep.has_latency);

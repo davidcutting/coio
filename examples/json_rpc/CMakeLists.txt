@@ -7,7 +7,7 @@ add_executable(
 target_link_libraries(
     example-json_rpc_client
     PRIVATE
-    coio
+    kioto
 )
 
 add_executable(
@@ -19,5 +19,5 @@ add_executable(
 target_link_libraries(
     example-json_rpc_server
     PRIVATE
-    coio
+    kioto
 )

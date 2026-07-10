@@ -11,26 +11,26 @@
 #include <utility>
 #include <variant>
 #include <vector>
-#include <coio/core.h>
-#include <coio/net/socket.h>
-#include <coio/net/tcp.h>
+#include <kioto/core.h>
+#include <kioto/net/socket.h>
+#include <kioto/net/tcp.h>
 #include "../common.h"
 
-#if COIO_OS_LINUX
-#include <coio/asyncio/epoll_context.h>
+#if KIOTO_OS_LINUX
+#include <kioto/io/driver/epoll_context.h>
 namespace json_rpc {
-    using io_context = coio::epoll_context;
+    using io_context = kioto::epoll_context;
 }
-#elif COIO_OS_WINDOWS
-#include <coio/asyncio/iocp_context.h>
+#elif KIOTO_OS_WINDOWS
+#include <kioto/io/driver/iocp_context.h>
 namespace json_rpc {
-    using io_context = coio::iocp_context;
+    using io_context = kioto::iocp_context;
 }
 #endif
 
 namespace json_rpc {
-    using tcp_socket = coio::tcp::socket<io_context::scheduler>;
-    using tcp_acceptor = coio::tcp::acceptor<io_context::scheduler>;
+    using tcp_socket = kioto::tcp::socket<io_context::scheduler>;
+    using tcp_acceptor = kioto::tcp::acceptor<io_context::scheduler>;
 
     enum errc : int {
         parse_error      = -32700,
@@ -56,7 +56,7 @@ namespace json_rpc {
 
     class value {
     private:
-        using types_ = coio::type_list<null, boolean, number, string, array, object>;
+        using types_ = kioto::type_list<null, boolean, number, string, array, object>;
         using variant_t_ = types_::apply<std::variant>;
 
     public:
@@ -436,13 +436,13 @@ namespace json_rpc {
         struct parse_fn {
             template<typename Range> requires std::ranges::borrowed_range<Range> and std::ranges::input_range<Range> and std::convertible_to<std::ranges::range_value_t<Range>, char>
             [[nodiscard]]
-            COIO_STATIC_CALL_OP auto operator() (Range&& source) COIO_STATIC_CALL_OP_CONST -> value {
+            KIOTO_STATIC_CALL_OP auto operator() (Range&& source) KIOTO_STATIC_CALL_OP_CONST -> value {
                 return parser{std::forward<Range>(source)}.parse();
             }
 
             template<std::input_iterator It, std::sentinel_for<It> St> requires std::convertible_to<std::iter_value_t<It>, char>
             [[nodiscard]]
-            COIO_STATIC_CALL_OP auto operator() (It it, St st) COIO_STATIC_CALL_OP_CONST -> value {
+            KIOTO_STATIC_CALL_OP auto operator() (It it, St st) KIOTO_STATIC_CALL_OP_CONST -> value {
                 return parser{std::move(it), std::move(st)}.parse();
             }
         };
@@ -476,7 +476,7 @@ namespace json_rpc {
                 return detail::dump_object(data);
             }
             else {
-                coio::unreachable();
+                kioto::unreachable();
             }
         });
     }

@@ -21,22 +21,22 @@
 #include <utility>
 #include <vector>
 #include <doctest/doctest.h>
-#include <coio/core.h>
-#include <coio/runtime.h>
-#include <coio/asyncio/io.h>
-#include <coio/asyncio/pipe.h>
+#include <kioto/core.h>
+#include <kioto/runtime/runtime.h>
+#include <kioto/io/io.h>
+#include <kioto/io/pipe.h>
 #include "io_contexts.h"
 
 using namespace std::chrono_literals;
 
 namespace {
-    COIO_ALWAYS_INLINE auto dispatch_result(std::error_code ec, std::size_t n) noexcept {
-        coio::async_result<coio::execution::set_value_t(std::size_t), coio::execution::set_error_t(std::error_code)> r;
+    KIOTO_ALWAYS_INLINE auto dispatch_result(std::error_code ec, std::size_t n) noexcept {
+        kioto::async_result<kioto::execution::set_value_t(std::size_t), kioto::execution::set_error_t(std::error_code)> r;
         if (ec) { if (ec == std::errc::operation_canceled) r.set_stopped(); else r.set_error(ec); }
         else r.set_value(n);
         return r;
     }
-    inline const auto as_throwing = coio::execution::let_value(dispatch_result);
+    inline const auto as_throwing = kioto::execution::let_value(dispatch_result);
 
     // Type-erased stash. Whichever thread calls drain() destroys the handles it pops — deliberately not the
     // owner worker, so idle off-owner teardown is exercised.
@@ -61,12 +61,12 @@ namespace {
     };
 
     template<typename Sched>
-    auto roundtrip(std::shared_ptr<std::pair<coio::pipe_reader<Sched>, coio::pipe_writer<Sched>>> p,
-                   handle_sink& sink, std::atomic<int>& ok) -> coio::task<> {
+    auto roundtrip(std::shared_ptr<std::pair<kioto::pipe_reader<Sched>, kioto::pipe_writer<Sched>>> p,
+                   handle_sink& sink, std::atomic<int>& ok) -> kioto::task<> {
         static constexpr std::string_view msg = "ping";
         char buf[8];
-        co_await (coio::async_write(p->second, coio::as_bytes(msg)) | as_throwing);       // fits the pipe buffer
-        const auto n = co_await p->first.async_read_some(coio::as_writable_bytes(buf));
+        co_await (kioto::async_write(p->second, kioto::as_bytes(msg)) | as_throwing);       // fits the pipe buffer
+        const auto n = co_await p->first.async_read_some(kioto::as_writable_bytes(buf));
         if (n == msg.size()) ok.fetch_add(1, std::memory_order_relaxed);
         sink.push(std::move(p));   // hand the last-ref race to the draining thread; the frame drops its ref on return
     }
@@ -74,11 +74,11 @@ namespace {
     template<typename Runtime>
     auto spawn_batch(Runtime& rt, handle_sink& sink, std::atomic<int>& ok, int n) -> void {
         for (int i = 0; i < n; ++i) {
-            rt.spawn(coio::just() | coio::then([&rt, &sink, &ok] {
+            rt.spawn(kioto::just() | kioto::then([&rt, &sink, &ok] {
                 auto ws = *Runtime::current_scheduler();
                 using Sched = decltype(ws);
-                auto [reader, writer] = coio::make_pipe(ws);
-                auto p = std::make_shared<std::pair<coio::pipe_reader<Sched>, coio::pipe_writer<Sched>>>(
+                auto [reader, writer] = kioto::make_pipe(ws);
+                auto p = std::make_shared<std::pair<kioto::pipe_reader<Sched>, kioto::pipe_writer<Sched>>>(
                     std::move(reader), std::move(writer));
                 rt.spawn_on(ws, roundtrip<Sched>(std::move(p), sink, ok));
             }));
@@ -120,20 +120,20 @@ namespace {
     }
 }
 
-#if COIO_HAS_IO_URING
+#if KIOTO_HAS_IO_URING
 TEST_CASE("uring: idle handles dropped off-owner during a live reactor tear down cleanly") {
-    run_off_owner_teardown_stress([] { return coio::uring_runtime{4}; });
+    run_off_owner_teardown_stress([] { return kioto::uring_runtime{4}; });
 }
 #endif
 
-#if COIO_HAS_EPOLL
+#if KIOTO_HAS_EPOLL
 TEST_CASE("epoll: idle handles dropped off-owner during a live reactor tear down cleanly") {
-    run_off_owner_teardown_stress([] { return coio_test::make_runtime<coio::epoll_context>(4); });
+    run_off_owner_teardown_stress([] { return kioto_test::make_runtime<kioto::epoll_context>(4); });
 }
 #endif
 
-#if COIO_HAS_IOCP
+#if KIOTO_HAS_IOCP
 TEST_CASE("iocp: idle handles dropped off-owner during a live reactor tear down cleanly") {
-    run_off_owner_teardown_stress([] { return coio_test::make_runtime<coio::iocp_context>(4); });
+    run_off_owner_teardown_stress([] { return kioto_test::make_runtime<kioto::iocp_context>(4); });
 }
 #endif

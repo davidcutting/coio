@@ -4,7 +4,7 @@
 #include <iostream>
 #include <syncstream>
 #include <thread>
-#include <coio/utils/async_result.h>
+#include <kioto/exec/async_result.h>
 
 template<typename... Args>
 auto print(std::ostream& out, std::format_string<Args...> fmt, Args&&... args) ->void {
@@ -42,8 +42,8 @@ auto debug(std::format_string<Args...> fmt, Args&&... args) -> void {
         std::format(fmt, std::forward<Args>(args)...) << std::endl;
 }
 
-COIO_ALWAYS_INLINE auto dispatch_result(std::error_code ec, std::size_t bytes_transferred) noexcept {
-    coio::async_result<coio::execution::set_value_t(std::size_t), coio::execution::set_error_t(std::error_code)> result;
+KIOTO_ALWAYS_INLINE auto dispatch_result(std::error_code ec, std::size_t bytes_transferred) noexcept {
+    kioto::async_result<kioto::execution::set_value_t(std::size_t), kioto::execution::set_error_t(std::error_code)> result;
     if (ec) {
         if (ec == std::errc::operation_canceled) result.set_stopped();
         else result.set_error(ec);
@@ -52,4 +52,4 @@ COIO_ALWAYS_INLINE auto dispatch_result(std::error_code ec, std::size_t bytes_tr
     return result;
 }
 
-inline const auto as_throwing = coio::execution::let_value(dispatch_result);
+inline const auto as_throwing = kioto::execution::let_value(dispatch_result);

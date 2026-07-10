@@ -1,9 +1,9 @@
 FROM archlinux:latest
 
-LABEL maintainer="coio"
-LABEL description="Development environment for coio"
+LABEL maintainer="kioto"
+LABEL description="Development environment for kioto"
 
-WORKDIR /workspace/coio
+WORKDIR /workspace/kioto
 
 RUN pacman -Syu --noconfirm && \
     pacman -S --noconfirm \
@@ -24,13 +24,13 @@ RUN pacman -Syu --noconfirm && \
     vim \
     && pacman -Scc --noconfirm
 
-COPY . /workspace/coio
+COPY . /workspace/kioto
 
 RUN cmake -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=Debug \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-    -DCOIO_BUILD_EXAMPLES=ON \
-    -DCOIO_SENDERS_BACKEND=NVIDIA \
+    -DKIOTO_BUILD_EXAMPLES=ON \
+    -DKIOTO_SENDERS_BACKEND=NVIDIA \
     && cmake --build build -j$(nproc)
 
 EXPOSE 8080 8086

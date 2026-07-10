@@ -1,22 +1,22 @@
-#include <coio/core.h>
-#include <coio/asyncio/io.h>
-#include <coio/asyncio/file.h>
+#include <kioto/core.h>
+#include <kioto/io/io.h>
+#include <kioto/io/file.h>
 #include "common.h"
 
-#if COIO_OS_LINUX
-#include <coio/asyncio/uring_context.h>
-using io_context = coio::uring_context;
-#elif COIO_OS_WINDOWS
-#include <coio/asyncio/iocp_context.h>
-using io_context = coio::iocp_context;
+#if KIOTO_OS_LINUX
+#include <kioto/io/driver/uring_context.h>
+using io_context = kioto::uring_context;
+#elif KIOTO_OS_WINDOWS
+#include <kioto/io/driver/iocp_context.h>
+using io_context = kioto::iocp_context;
 #endif
 
-using random_access_file = coio::random_access_file<io_context::scheduler>;
+using random_access_file = kioto::random_access_file<io_context::scheduler>;
 
 constexpr std::size_t block_size = 1024;
 
-auto async_copy_file(coio::zstring_view src, coio::zstring_view dst) -> io_context::task<> {
-    auto scheduler = co_await coio::execution::read_env(coio::execution::get_scheduler);
+auto async_copy_file(kioto::zstring_view src, kioto::zstring_view dst) -> io_context::task<> {
+    auto scheduler = co_await kioto::execution::read_env(kioto::execution::get_scheduler);
     random_access_file src_file{
         scheduler,
         src,
@@ -36,13 +36,13 @@ auto async_copy_file(coio::zstring_view src, coio::zstring_view dst) -> io_conte
         std::byte buffer[block_size];
         std::size_t offset = 0;
         while (offset < total_size) {
-            const auto n = co_await src_file.async_read_some_at(offset, coio::as_writable_bytes(buffer));
-            co_await coio::async_write_at(dst_file, offset, coio::as_bytes(buffer, n));
+            const auto n = co_await src_file.async_read_some_at(offset, kioto::as_writable_bytes(buffer));
+            co_await kioto::async_write_at(dst_file, offset, kioto::as_bytes(buffer, n));
             offset += n;
         }
     }
     catch (const std::system_error& e) {
-        if (e.code() != coio::error::eof) throw;
+        if (e.code() != kioto::error::eof) throw;
     }
 
     dst_file.sync_all();
@@ -55,9 +55,9 @@ auto main(int argc, char** argv) -> int try {
     }
 
     io_context context;
-    coio::this_thread::sync_wait(coio::when_all(
-        coio::starts_on(context.get_scheduler(), async_copy_file(argv[1], argv[2])),
-        [&]() -> coio::task<> {
+    kioto::this_thread::sync_wait(kioto::when_all(
+        kioto::starts_on(context.get_scheduler(), async_copy_file(argv[1], argv[2])),
+        [&]() -> kioto::task<> {
             context.run();
             co_return;
         }()

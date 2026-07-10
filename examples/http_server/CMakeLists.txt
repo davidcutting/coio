@@ -14,7 +14,7 @@ add_executable(
 target_link_libraries(
     example-http_server
     PRIVATE
-    coio
+    kioto
 )
 
 target_compile_definitions(

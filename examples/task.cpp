@@ -1,4 +1,4 @@
-#include <coio/core.h>
+#include <kioto/core.h>
 #include "common.h"
 
 struct my_allocator_global_state {
@@ -44,8 +44,8 @@ struct my_allocator : my_allocator_global_state {
     }
 };
 
-auto bar(std::allocator_arg_t, auto) -> coio::task<> {
-    auto alloc = co_await coio::execution::read_env(coio::get_allocator);
+auto bar(std::allocator_arg_t, auto) -> kioto::task<> {
+    auto alloc = co_await kioto::execution::read_env(kioto::get_allocator);
     using string_allocator = typename std::allocator_traits<decltype(alloc)>::template rebind_alloc<char>;
     using string = std::basic_string<char, std::char_traits<char>, string_allocator>;
     // `str` will be allocated on `alloc`
@@ -53,19 +53,19 @@ auto bar(std::allocator_arg_t, auto) -> coio::task<> {
     ::println("{}", str);
 }
 
-auto foo(std::allocator_arg_t, auto) -> coio::task<> {
+auto foo(std::allocator_arg_t, auto) -> kioto::task<> {
     ::println("foo");
-    co_await bar(std::allocator_arg, co_await coio::execution::read_env(coio::get_allocator));
+    co_await bar(std::allocator_arg, co_await kioto::execution::read_env(kioto::get_allocator));
 }
 
-auto qux() -> coio::task<void, my_allocator<>> {
+auto qux() -> kioto::task<void, my_allocator<>> {
     ::println("qux");
-    co_await bar(std::allocator_arg, co_await coio::execution::read_env(coio::get_allocator));
+    co_await bar(std::allocator_arg, co_await kioto::execution::read_env(kioto::get_allocator));
 }
 
-auto baz() -> coio::task<void, void, coio::time_loop::scheduler> {
+auto baz() -> kioto::task<void, void, kioto::time_loop::scheduler> {
     using namespace std::chrono_literals;
-    coio::time_loop::scheduler sched = co_await coio::execution::read_env(coio::execution::get_start_scheduler);
+    kioto::time_loop::scheduler sched = co_await kioto::execution::read_env(kioto::execution::get_start_scheduler);
     co_await sched.schedule_after(1s);
     ::println("baz");
 }
@@ -75,17 +75,17 @@ auto main() -> int {
         std::byte buffer[1024];
         std::pmr::monotonic_buffer_resource resource{buffer, std::ranges::size(buffer), std::pmr::null_memory_resource()};
         // the coroutine `foo`, and `bar` at line 58, will be allocated on `buffer`
-        coio::this_thread::sync_wait(foo(std::allocator_arg, std::pmr::polymorphic_allocator<>{&resource}));
+        kioto::this_thread::sync_wait(foo(std::allocator_arg, std::pmr::polymorphic_allocator<>{&resource}));
 
         // the coroutine `qux`, and `bar` at line 63, will be allocated on `my_allocator_global_state::buffer`
-        coio::this_thread::sync_wait(qux());
+        kioto::this_thread::sync_wait(qux());
     }
 
     {
-        coio::time_loop loop;
-        coio::async_scope scope;
-        scope.spawn(coio::starts_on(loop.get_scheduler(), baz()));
+        kioto::time_loop loop;
+        kioto::async_scope scope;
+        scope.spawn(kioto::starts_on(loop.get_scheduler(), baz()));
         loop.run();
-        coio::this_thread::sync_wait(scope.join());
+        kioto::this_thread::sync_wait(scope.join());
     }
 }

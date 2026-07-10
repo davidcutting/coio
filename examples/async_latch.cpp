@@ -1,6 +1,6 @@
 // Adapted from https://en.cppreference.com/w/cpp/thread/latch.html#Example
-#include <coio/core.h>
-#include <coio/sync_primitives.h>
+#include <kioto/core.h>
+#include <kioto/exec/sync_primitives.h>
 #include "common.h"
 
 struct Job {
@@ -8,7 +8,7 @@ struct Job {
     std::string product;
 };
 
-auto work(Job& job, coio::async_latch<>& work_done, coio::async_latch<>& start_clean_up) -> coio::task<> {
+auto work(Job& job, kioto::async_latch<>& work_done, kioto::async_latch<>& start_clean_up) -> kioto::task<> {
     job.product = job.name + " worked";
     work_done.count_down();
     co_await start_clean_up.wait();
@@ -17,16 +17,16 @@ auto work(Job& job, coio::async_latch<>& work_done, coio::async_latch<>& start_c
 
 auto main() -> int {
     Job jobs[]{{"Annika"}, {"Buru"}, {"Chuck"}};
-    coio::async_latch<> work_done{std::ranges::size(jobs)};
-    coio::async_latch<> start_clean_up{1};
+    kioto::async_latch<> work_done{std::ranges::size(jobs)};
+    kioto::async_latch<> start_clean_up{1};
 
-    coio::async_scope scope;
+    kioto::async_scope scope;
     ::print("Work is starting... ");
     for (auto& job : jobs) {
         scope.spawn(work(job, work_done, start_clean_up));
     }
 
-    coio::this_thread::sync_wait(work_done.wait());
+    kioto::this_thread::sync_wait(work_done.wait());
     ::println("done:");
     for (const auto& job : jobs) {
         ::println(" {}", job.product);
@@ -35,7 +35,7 @@ auto main() -> int {
     ::print("Workers are cleaning up... ");
     start_clean_up.count_down();
 
-    coio::this_thread::sync_wait(scope.join());
+    kioto::this_thread::sync_wait(scope.join());
     ::println("done:");
     for (const auto& job : jobs) {
         ::println(" {}", job.product);

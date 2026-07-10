@@ -1,9 +1,9 @@
-# coio Reference
+# kioto Reference
 
-This document describes the public API of **coio**. It is intended to be a stable reference for headers under `include/coio/`.
+This document describes the public API of **kioto**. It is intended to be a stable reference for headers under `include/kioto/`.
 
 - **Language level**: C++20 (the library). `std::execution` is provided by an implementation library (P2300).
-- **Scope**: coio types and contracts. Standard `std::execution` algorithms are not re-documented here.
+- **Scope**: kioto types and contracts. Standard `std::execution` algorithms are not re-documented here.
 - **Platform**: Core types are portable; async I/O + networking backends are currently available on Linux and Windows.
 
 ## Contents
@@ -20,7 +20,7 @@ This document describes the public API of **coio**. It is intended to be a stabl
   - [4.4 uring_context (Linux)](#44-uring_context-linux)
   - [4.5 iocp_context (Windows)](#45-iocp_context-windows)
   - [4.5 work_guard](#46-work_guard)
-- [5. Waiting & coio-specific algorithms](#5-waiting--coio-specific-algorithms)
+- [5. Waiting & kioto-specific algorithms](#5-waiting--kioto-specific-algorithms)
 - [6. Utilities](#6-utilities)
   - [6.1 async_scope](#61-async_scope)
   - [6.2 timer](#62-timer)
@@ -36,9 +36,9 @@ This document describes the public API of **coio**. It is intended to be a stabl
 
 ### Senders, awaitables, and composition
 
-- Many coio operations are **senders** (P2300). They can be composed with `std::execution` algorithms.
-- `coio::task<T, Allocator, Scheduler>` is both a coroutine type and a sender.
-- Inside a `coio::task`, you can `co_await` a sender (coio wires sender-to-awaitable via `await_transform`).
+- Many kioto operations are **senders** (P2300). They can be composed with `std::execution` algorithms.
+- `kioto::task<T, Allocator, Scheduler>` is both a coroutine type and a sender.
+- Inside a `kioto::task`, you can `co_await` a sender (kioto wires sender-to-awaitable via `await_transform`).
 
 ### Stop tokens and cancellation
 
@@ -51,21 +51,21 @@ This document describes the public API of **coio**. It is intended to be a stabl
 
 | Area                       | Header                                                   |
 |----------------------------|----------------------------------------------------------|
-| Core concepts + algorithms | `#include <coio/core.h>`                                 |
-| task                       | `#include <coio/task.h>`                                 |
-| generator                  | `#include <coio/generator.h>`                            |
-| time_loop + work_guard     | `#include <coio/execution_context.h>`                    |
-| epoll backend              | `#include <coio/asyncio/epoll_context.h>`                |
-| io_uring backend           | `#include <coio/asyncio/uring_context.h>`                |
-| iocp backend               | `#include <coio/asyncio/iocp_context.h>`                 |
-| timers                     | `#include <coio/utils/timer.h>`                          |
-| async_scope                | `#include <coio/utils/async_scope.h>`                    |
-| sync primitives            | `#include <coio/sync_primitives.h>`                      |
-| I/O helpers                | `#include <coio/asyncio/io.h>`                           |
-| networking basics          | `#include <coio/net/basic.h>`                            |
-| TCP/UDP descriptors        | `#include <coio/net/tcp.h>`, `#include <coio/net/udp.h>` |
-| sockets                    | `#include <coio/net/socket.h>`                           |
-| resolver                   | `#include <coio/net/resolver.h>`                         |
+| Core concepts + algorithms | `#include <kioto/core.h>`                                 |
+| task                       | `#include <kioto/exec/task.h>`                                 |
+| generator                  | `#include <kioto/exec/generator.h>`                            |
+| time_loop + work_guard     | `#include <kioto/io/execution_context.h>`                    |
+| epoll backend              | `#include <kioto/io/driver/epoll_context.h>`                |
+| io_uring backend           | `#include <kioto/io/driver/uring_context.h>`                |
+| iocp backend               | `#include <kioto/io/driver/iocp_context.h>`                 |
+| timers                     | `#include <kioto/base/timer.h>`                          |
+| async_scope                | `#include <kioto/exec/async_scope.h>`                    |
+| sync primitives            | `#include <kioto/exec/sync_primitives.h>`                      |
+| I/O helpers                | `#include <kioto/io/io.h>`                           |
+| networking basics          | `#include <kioto/base/basic.h>`                            |
+| TCP/UDP descriptors        | `#include <kioto/net/tcp.h>`, `#include <kioto/net/udp.h>` |
+| sockets                    | `#include <kioto/net/socket.h>`                           |
+| resolver                   | `#include <kioto/net/resolver.h>`                         |
 
 ---
 
@@ -73,9 +73,9 @@ This document describes the public API of **coio**. It is intended to be a stabl
 
 ### 3.1 task
 
-Header: `#include <coio/task.h>`
+Header: `#include <kioto/exec/task.h>`
 
-`coio::task<T, Allocator, Scheduler>` is a **lazily-started, move-only coroutine type** that also models a **sender**.
+`kioto::task<T, Allocator, Scheduler>` is a **lazily-started, move-only coroutine type** that also models a **sender**.
 
 **Properties**
 
@@ -87,13 +87,13 @@ Header: `#include <coio/task.h>`
 **Typical usage**
 
 ```cpp
-auto foo() -> coio::task<int> {
+auto foo() -> kioto::task<int> {
     co_return 42;
 }
 
 int x = co_await foo();
 
-auto r = coio::this_thread::sync_wait(foo());
+auto r = kioto::this_thread::sync_wait(foo());
 ```
 
 **Notes**
@@ -102,21 +102,21 @@ auto r = coio::this_thread::sync_wait(foo());
 
 ### 3.2 generator
 
-Header: `#include <coio/generator.h>`
+Header: `#include <kioto/exec/generator.h>`
 
-`coio::generator<Ref, Val, Allocator>` is a **synchronous generator** with lazy `co_yield`.
+`kioto::generator<Ref, Val, Allocator>` is a **synchronous generator** with lazy `co_yield`.
 It is same as [P2502 - std::generator](https://wg21.link/p2502) in C++23, but works in C++20.
 
 **Properties**
 
 - Models `std::ranges::view_interface`.
 - Single-pass input iteration.
-- Supports recursive generation via `coio::elements_of(range_or_generator)`.
+- Supports recursive generation via `kioto::elements_of(range_or_generator)`.
 
 **Example**
 
 ```cpp
-auto fibonacci(std::size_t n) -> coio::generator<int> {
+auto fibonacci(std::size_t n) -> kioto::generator<int> {
     int a = 0, b = 1;
     while (n--) {
         co_yield b;
@@ -142,7 +142,7 @@ Work submitted to the context may be executed by **any** thread currently callin
 
 ### 4.2 time_loop
 
-Header: `#include <coio/execution_context.h>`
+Header: `#include <kioto/io/execution_context.h>`
 
 Execution context with a timer queue and a manually-driven event loop.
 
@@ -169,42 +169,42 @@ Execution context with a timer queue and a manually-driven event loop.
 
 ### 4.3 epoll_context (Linux)
 
-Header: `#include <coio/asyncio/epoll_context.h>`
+Header: `#include <kioto/io/driver/epoll_context.h>`
 
 Execution context backed by **epoll**. Includes all `time_loop` APIs plus epoll-based async I/O.
 
 ### 4.4 uring_context (Linux)
 
-Header: `#include <coio/asyncio/uring_context.h>`
+Header: `#include <kioto/io/driver/uring_context.h>`
 
 Execution context backed by **io_uring**. Includes all `time_loop` APIs plus io_uring-based async I/O.
 
 ### 4.5 iocp_context (Windows)
 
-Header: `#include <coio/asyncio/iocp_context.h>`
+Header: `#include <kioto/io/driver/iocp_context.h>`
 
 Execution context backed by **IOCP**. Includes all `time_loop` APIs plus IOCP-based async I/O.
 
 ### 4.6 work_guard
 
-Header: `#include <coio/execution_context.h>`
+Header: `#include <kioto/io/execution_context.h>`
 
-`coio::work_guard<ExecutionContext>` is an RAII guard that increments the context work count and keeps `run()` from returning.
+`kioto::work_guard<ExecutionContext>` is an RAII guard that increments the context work count and keeps `run()` from returning.
 
 ---
 
-## 5. Waiting & coio-specific algorithms
+## 5. Waiting & kioto-specific algorithms
 
-Header: `#include <coio/core.h>`
+Header: `#include <kioto/core.h>`
 
 ### Synchronous waiting
 
-- `coio::this_thread::sync_wait(sender)`
-- `coio::this_thread::sync_wait_with_variant(sender)`
+- `kioto::this_thread::sync_wait(sender)`
+- `kioto::this_thread::sync_wait_with_variant(sender)`
 
 These block the current thread until the sender completes.
 
-### coio-specific algorithms
+### kioto-specific algorithms
 
 | Algorithm | Description |
 |-----------|-------------|
@@ -218,7 +218,7 @@ These block the current thread until the sender completes.
 
 ### 6.1 async_scope
 
-Header: `#include <coio/utils/async_scope.h>`
+Header: `#include <kioto/exec/async_scope.h>`
 
 A [scope](https://wg21.link/p3149#introduction) object for spawning background work.
 
@@ -228,7 +228,7 @@ A [scope](https://wg21.link/p3149#introduction) object for spawning background w
 
 ### 6.2 timer
 
-Header: `#include <coio/utils/timer.h>`
+Header: `#include <kioto/base/timer.h>`
 
 Timer bound to a scheduler.
 
@@ -240,7 +240,7 @@ Timer bound to a scheduler.
 
 ## 7. Async I/O utilities
 
-Header: `#include <coio/asyncio/io.h>`
+Header: `#include <kioto/io/io.h>`
 
 This header provides concepts and helper functions for `read`, `write`, and delimiter-based reads.
 
@@ -252,7 +252,7 @@ This header provides concepts and helper functions for `read`, `write`, and deli
 
 ## 8. Networking
 
-Headers: `#include <coio/net/...>`
+Headers: `#include <kioto/net/...>`
 
 > Networking backends are currently implemented only on Linux and Windows.
 
@@ -267,7 +267,7 @@ Headers: `#include <coio/net/...>`
 
 ### Socket types
 
-Header: `#include <coio/net/socket.h>`
+Header: `#include <kioto/net/socket.h>`
 
 - `basic_socket<Protocol, IoScheduler>`: open/close/bind/connect/options
 - `basic_socket_acceptor<Protocol, IoScheduler>`: listen/accept
@@ -281,7 +281,7 @@ Be careful with the term "concurrency":
 - **Concurrent calls** refers to *thread-safety*: two threads calling member functions on the same object at the same time.
 - **Outstanding (pending) operations** refers to async operations that have been initiated and have not completed yet.
 
-Like Asio sockets/streams, coio socket/acceptor objects are **not thread-safe**. In other words, **member functions must not be called concurrently** on the same socket/acceptor from multiple threads unless you provide external synchronization.
+Like Asio sockets/streams, kioto socket/acceptor objects are **not thread-safe**. In other words, **member functions must not be called concurrently** on the same socket/acceptor from multiple threads unless you provide external synchronization.
 
 If you drive the owning execution context from a single thread, and ensure all socket/acceptor
 operations are initiated from work running on that thread, that thread acts as an
@@ -321,13 +321,13 @@ owning thread/task).
 
 ### EOF behavior
 
-`basic_stream_socket::read_some/async_read_some` report connection close as `coio::error::misc_errc::eof`.
+`basic_stream_socket::read_some/async_read_some` report connection close as `kioto::error::misc_errc::eof`.
 
 ---
 
 ## 9. Synchronization primitives
 
-Header: `#include <coio/sync_primitives.h>`
+Header: `#include <kioto/exec/sync_primitives.h>`
 
 - `async_mutex`
 - `async_semaphore` (and `async_binary_semaphore`)
@@ -339,7 +339,7 @@ These primitives suspend coroutines instead of blocking threads.
 
 ## 10. Error handling
 
-`coio::error::misc_errc` includes library-specific error codes.
+`kioto::error::misc_errc` includes library-specific error codes.
 
 - `eof`: end of stream
 

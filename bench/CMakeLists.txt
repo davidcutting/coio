@@ -1,4 +1,4 @@
-project(coio-benchmarks)
+project(kioto-benchmarks)
 
 CPMFindPackage(
     NAME benchmark
@@ -11,17 +11,17 @@ CPMFindPackage(
     "BENCHMARK_ENABLE_INSTALL OFF"
 )
 
-file(GLOB COIO_BENCH_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/bench_*.cpp")
+file(GLOB KIOTO_BENCH_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/bench_*.cpp")
 
-foreach(COIO_BENCH_SOURCE IN LISTS COIO_BENCH_SOURCES)
-    get_filename_component(COIO_BENCH_NAME "${COIO_BENCH_SOURCE}" NAME_WE)
+foreach(KIOTO_BENCH_SOURCE IN LISTS KIOTO_BENCH_SOURCES)
+    get_filename_component(KIOTO_BENCH_NAME "${KIOTO_BENCH_SOURCE}" NAME_WE)
 
-    add_executable(${COIO_BENCH_NAME} ${COIO_BENCH_SOURCE})
+    add_executable(${KIOTO_BENCH_NAME} ${KIOTO_BENCH_SOURCE})
 
     target_link_libraries(
-        ${COIO_BENCH_NAME}
+        ${KIOTO_BENCH_NAME}
         PRIVATE
-        coio
+        kioto
         benchmark::benchmark
         benchmark::benchmark_main
     )

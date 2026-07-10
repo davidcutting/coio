@@ -5,20 +5,20 @@
 #include <memory>
 #include <mutex>
 #include <doctest/doctest.h>
-#include <coio/core.h>
-#include <coio/runtime.h>
-#include <coio/detail/execution.h>
-#include <coio/detail/operation_base.h>
+#include <kioto/core.h>
+#include <kioto/runtime/runtime.h>
+#include <kioto/exec/execution.h>
+#include <kioto/exec/operation_base.h>
 
 namespace {
     // A worker with no reactor: the runtime posts balanced ops onto it via post_node(); it drains them
     // and parks on a condvar otherwise. Satisfies runtime_worker, so basic_runtime can own and drive it.
     struct mock_worker {
-        [[nodiscard]] auto get_scheduler() noexcept { return coio::execution::inline_scheduler{}; }
+        [[nodiscard]] auto get_scheduler() noexcept { return kioto::execution::inline_scheduler{}; }
         auto work_started() noexcept -> void { ++work_count_; }
         auto work_finished() noexcept -> void { --work_count_; }
 
-        auto submit(coio::detail::operation_base& op) noexcept -> void {
+        auto submit(kioto::detail::operation_base& op) noexcept -> void {
             { std::scoped_lock lk{mtx_}; inbox_.push_back(&op); }
             cv_.notify_one();
         }
@@ -51,27 +51,27 @@ namespace {
         std::atomic<int> work_count_{0};
         std::mutex mtx_;
         std::condition_variable cv_;
-        std::deque<coio::detail::operation_base*> inbox_;
+        std::deque<kioto::detail::operation_base*> inbox_;
         bool notified_ = false;
         bool stopped_ = false;
     };
 
-    static_assert(coio::runtime_worker<mock_worker>);
+    static_assert(kioto::runtime_worker<mock_worker>);
 }
 
 TEST_CASE("basic_runtime distributes balanced work across workers' inboxes (mock workers, no backend)") {
-    coio::basic_runtime<mock_worker> runtime{
+    kioto::basic_runtime<mock_worker> runtime{
         3, [](std::size_t) { return std::make_unique<mock_worker>(); }
     };
 
     std::atomic<int> done{0};
     constexpr int task_count = 200;
     for (int i = 0; i < task_count; ++i) {
-        runtime.spawn(coio::just() | coio::then([&done] {
+        runtime.spawn(kioto::just() | kioto::then([&done] {
             done.fetch_add(1, std::memory_order_relaxed);
         }));
     }
-    coio::this_thread::sync_wait(runtime.join());
+    kioto::this_thread::sync_wait(runtime.join());
 
     CHECK_EQ(done.load(), task_count);
 }

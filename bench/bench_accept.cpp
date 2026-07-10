@@ -14,12 +14,12 @@
 #include <utility>
 #include <vector>
 #include <benchmark/benchmark.h>
-#include <coio/core.h>
-#include <coio/net/socket.h>                 // detail::accept_sequence_loop, to_handle/to_native/native_handle
-#include <coio/asyncio/uring_context.h>      // accept_multishot, make_io_handle
+#include <kioto/core.h>
+#include <kioto/net/socket.h>                 // detail::accept_sequence_loop, to_handle/to_native/native_handle
+#include <kioto/io/driver/uring_context.h>      // accept_multishot, make_io_handle
 
 namespace {
-    using io_context = coio::uring_context;
+    using io_context = kioto::uring_context;
     using scheduler = io_context::scheduler;
 
     constexpr int B = 3500;   // established connections pre-queued (< somaxconn 4096, so all queue cleanly)
@@ -58,8 +58,8 @@ namespace {
     }
 
     template<typename Seq>
-    auto consume(Seq seq, coio::inplace_stop_token tok) -> io_context::task<> {
-        co_await coio::stop_when(std::move(seq), tok);
+    auto consume(Seq seq, kioto::inplace_stop_token tok) -> io_context::task<> {
+        co_await kioto::stop_when(std::move(seq), tok);
     }
 
     void run_drain(benchmark::State& state, bool multishot) {
@@ -74,25 +74,25 @@ namespace {
             for (int i = 0; i < B; ++i) client_fds.push_back(connect_one(port));
 
             int accepted = 0;
-            coio::inplace_stop_source stop;
-            auto sink = [&accepted, &stop](coio::detail::native_handle h) noexcept {
-                rst_close(coio::detail::to_native(h));   // same per-accept cost for both lowerings (a constant)
+            kioto::inplace_stop_source stop;
+            auto sink = [&accepted, &stop](kioto::detail::native_handle h) noexcept {
+                rst_close(kioto::detail::to_native(h));   // same per-accept cost for both lowerings (a constant)
                 if (++accepted >= B) stop.request_stop();
             };
             {
-                auto io_handle = sched.make_io_handle(coio::detail::to_handle(lfd));
-                coio::async_scope scope;
+                auto io_handle = sched.make_io_handle(kioto::detail::to_handle(lfd));
+                kioto::async_scope scope;
                 if (multishot)
                     scope.spawn_on(sched, consume(sched.accept_multishot(io_handle, sink), stop.get_token()));
                 else
                     scope.spawn_on(sched, consume(
-                        coio::detail::accept_sequence_loop<scheduler>(io_handle, sched, sink), stop.get_token()));
+                        kioto::detail::accept_sequence_loop<scheduler>(io_handle, sched, sink), stop.get_token()));
                 state.ResumeTiming();
 
                 ctx.run();   // TIMED: drain all B queued connections, then the sink trips stop -> run() exits
 
                 state.PauseTiming();
-                coio::this_thread::sync_wait(scope.join());
+                kioto::this_thread::sync_wait(scope.join());
             }
 
             for (int c : client_fds) rst_close(c);
@@ -107,10 +107,10 @@ namespace {
     BENCHMARK(accept_multishot_bench)->UseRealTime();
     BENCHMARK(accept_loop_bench)->UseRealTime();
 
-    // Init a raw ring with coio's EXACT setup (uring_context.cpp init_uring): single-issuer + defer/coop
+    // Init a raw ring with kioto's EXACT setup (uring_context.cpp init_uring): single-issuer + defer/coop
     // taskrun + submit-all + R_DISABLED, then enable + register the ring fd — so the raw baseline below is
-    // a fair apples-to-apples vs coio's ring, isolating ONLY coio's sender/coroutine machinery.
-    auto init_like_coio(::io_uring& ring) -> void {
+    // a fair apples-to-apples vs kioto's ring, isolating ONLY kioto's sender/coroutine machinery.
+    auto init_like_kioto(::io_uring& ring) -> void {
         for (const unsigned flags : {
                  unsigned{IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_R_DISABLED},
                  unsigned{IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_R_DISABLED}}) {
@@ -120,13 +120,13 @@ namespace {
         ::io_uring_register_ring_fd(&ring);
     }
 
-    // Raw multishot accept on a coio-configured ring, doing the SAME per-accept work as coio's sink
-    // (rst_close). The gap vs accept_multishot_bench (coio) is purely the sender/coroutine/schedule layer.
-    void raw_coio_config_bench(benchmark::State& state) {
+    // Raw multishot accept on a kioto-configured ring, doing the SAME per-accept work as kioto's sink
+    // (rst_close). The gap vs accept_multishot_bench (kioto) is purely the sender/coroutine/schedule layer.
+    void raw_kioto_config_bench(benchmark::State& state) {
         for (auto _ : state) {
             state.PauseTiming();
             ::io_uring ring{};
-            init_like_coio(ring);
+            init_like_kioto(ring);
             auto [lfd, port] = make_listener();
             std::vector<int> client_fds;
             client_fds.reserve(B);
@@ -141,7 +141,7 @@ namespace {
             while (accepted < B) {
                 ::io_uring_cqe* cqe = nullptr;
                 ::io_uring_wait_cqe(&ring, &cqe);
-                if (cqe->res >= 0) { rst_close(cqe->res); ++accepted; }   // same as coio's sink
+                if (cqe->res >= 0) { rst_close(cqe->res); ++accepted; }   // same as kioto's sink
                 ::io_uring_cqe_seen(&ring, cqe);
             }
 
@@ -153,5 +153,5 @@ namespace {
         }
         state.SetItemsProcessed(state.iterations() * B);
     }
-    BENCHMARK(raw_coio_config_bench)->UseRealTime();
+    BENCHMARK(raw_kioto_config_bench)->UseRealTime();
 }

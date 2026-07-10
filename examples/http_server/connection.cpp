@@ -2,8 +2,8 @@
 #include <charconv>
 #include <istream>
 #include <ranges>
-#include <coio/asyncio/io.h>
-#include <coio/utils/streambuf.h>
+#include <kioto/io/io.h>
+#include <kioto/base/streambuf.h>
 #include "connection.h"
 #include "request.h"
 #include "response.h"
@@ -98,12 +98,12 @@ namespace http {
 
     auto connection(
         tcp_socket socket,
-        coio::endpoint remote_endpoint,
+        kioto::endpoint remote_endpoint,
         router& router
     ) -> io_executor::task<> try {
         while (true) {
-            coio::streambuf buf;
-            co_await (coio::async_read_until(socket, buf, "\r\n\r\n") | as_throwing);
+            kioto::streambuf buf;
+            co_await (kioto::async_read_until(socket, buf, "\r\n\r\n") | as_throwing);
             std::istream stream(&buf);
             auto maybe_req = parse_line_and_headers(stream);
             if (!maybe_req) {
@@ -119,7 +119,7 @@ namespace http {
             if (auto maybe_content_length = parse_content_length(req); maybe_content_length > 0) {
                 const std::size_t content_length = *maybe_content_length;
                 if (buf.size() < content_length) {
-                    co_await (coio::async_read(socket, buf, content_length - buf.size()) | as_throwing);
+                    co_await (kioto::async_read(socket, buf, content_length - buf.size()) | as_throwing);
                 }
                 req.body.resize(content_length);
                 stream.read(req.body.data(), static_cast<std::streamsize>(content_length));

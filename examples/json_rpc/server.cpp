@@ -1,7 +1,7 @@
 #include <array>
-#include <coio/asyncio/io.h>
-#include <coio/utils/flat_buffer.h>
-#include <coio/utils/signal_wait.h>
+#include <kioto/io/io.h>
+#include <kioto/base/flat_buffer.h>
+#include <kioto/base/signal_wait.h>
 #include "json_rpc.h"
 
 auto get_operands(const json_rpc::value& params) -> std::optional<std::array<json_rpc::integer, 2>> {
@@ -116,9 +116,9 @@ auto handle_connection(json_rpc::tcp_socket socket) -> json_rpc::io_context::tas
     auto remote_endpoint = socket.remote_endpoint();
     ::debug("new connection from [{}]", remote_endpoint);
     try {
-        coio::flat_buffer buffer;
+        kioto::flat_buffer buffer;
         while (true) {
-            const auto n = co_await (coio::async_read_until(socket, buffer, '\n') | as_throwing);
+            const auto n = co_await (kioto::async_read_until(socket, buffer, '\n') | as_throwing);
             const auto data = buffer.data();
             const std::string_view line{reinterpret_cast<const char*>(data.data()), n};
             json_rpc::value response = json_rpc::object{
@@ -150,7 +150,7 @@ auto handle_connection(json_rpc::tcp_socket socket) -> json_rpc::io_context::tas
             }
             catch (json_rpc::bad_json& e) {}
             auto response_data = json_rpc::dump(response) + '\n';
-            co_await (coio::async_write(socket, coio::as_bytes(response_data)) | as_throwing);
+            co_await (kioto::async_write(socket, kioto::as_bytes(response_data)) | as_throwing);
             if (not has_continuation) co_return;
         }
     }
@@ -159,9 +159,9 @@ auto handle_connection(json_rpc::tcp_socket socket) -> json_rpc::io_context::tas
     }
 }
 
-auto start_server(coio::async_scope& scope) -> json_rpc::io_context::task<> try {
-    json_rpc::io_context::scheduler sched = co_await coio::read_scheduler();
-    json_rpc::tcp_acceptor acceptor{sched, coio::endpoint{coio::ipv4_address::any(), 9090}};
+auto start_server(kioto::async_scope& scope) -> json_rpc::io_context::task<> try {
+    json_rpc::io_context::scheduler sched = co_await kioto::read_scheduler();
+    json_rpc::tcp_acceptor acceptor{sched, kioto::endpoint{kioto::ipv4_address::any(), 9090}};
     ::debug("JSON-RPC server listening on {}", acceptor.local_endpoint());
     while (true) {
         scope.spawn_on(sched, handle_connection(co_await acceptor.async_accept()));
@@ -171,17 +171,17 @@ catch (const std::system_error& e) {
     ::println("acceptor error: {}", e.what());
 }
 
-auto signal_watchdog(json_rpc::io_context& context) -> coio::inline_task<> {
-    const int signum = co_await coio::signal_wait(SIGINT, SIGTERM);
-    ::debug("server stopping: signal ({}){}", signum, coio::strsignal(signum));
+auto signal_watchdog(json_rpc::io_context& context) -> kioto::inline_task<> {
+    const int signum = co_await kioto::signal_wait(SIGINT, SIGTERM);
+    ::debug("server stopping: signal ({}){}", signum, kioto::strsignal(signum));
     context.request_stop();
 }
 
 auto main() -> int {
     json_rpc::io_context context;
-    coio::async_scope scope;
+    kioto::async_scope scope;
     scope.spawn_on(context.get_scheduler(), start_server(scope));
     scope.spawn(signal_watchdog(context));
     context.run();
-    coio::this_thread::sync_wait(scope.join());
+    kioto::this_thread::sync_wait(scope.join());
 }

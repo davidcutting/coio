@@ -15,21 +15,21 @@
 #include <thread>
 #include <utility>
 #include <doctest/doctest.h>
-#include <coio/core.h>
-#include <coio/execution_context.h>
-#include <coio/time_loop.h>
-#include <coio/utils/async_scope.h>
-#include <coio/utils/async_result.h>
-#include <coio/detail/io_descriptions.h>
-#include <coio/detail/io_sender.h>
-#include <coio/detail/op_queue.h>
+#include <kioto/core.h>
+#include <kioto/io/execution_context.h>
+#include <kioto/io/time_loop.h>
+#include <kioto/exec/async_scope.h>
+#include <kioto/exec/async_result.h>
+#include <kioto/io/io_descriptions.h>
+#include <kioto/io/io_sender.h>
+#include <kioto/base/op_queue.h>
 
 namespace {
-    template<typename Executor, typename Base = coio::timer_scheduler<Executor>>
+    template<typename Executor, typename Base = kioto::timer_scheduler<Executor>>
     class mock_scheduler;
 
     // Stand-in for iocp_node (OVERLAPPED + run-queue node): the driver reaps it and dispatches complete().
-    struct mock_node : coio::detail::operation_base {
+    struct mock_node : kioto::detail::operation_base {
         virtual auto complete(int value) noexcept -> void = 0;
         auto request_cancel() noexcept -> void { cancel_requested = true; }
         bool cancel_requested = false;
@@ -40,22 +40,22 @@ namespace {
 
     class mock_driver {
     public:
-        using capabilities = coio::type_list<coio::capability::io, coio::capability::timer>;
+        using capabilities = kioto::type_list<kioto::capability::io, kioto::capability::timer>;
         template<typename Executor, typename Base>
-        using scheduler_mixin = mock_scheduler<Executor, coio::timer_scheduler<Executor, Base>>;
+        using scheduler_mixin = mock_scheduler<Executor, kioto::timer_scheduler<Executor, Base>>;
 
         struct io_ref {
             int fake_handle = -1;
         };
 
-        using supported_io_ops = coio::type_list<coio::detail::async_read_some_t>;
+        using supported_io_ops = kioto::type_list<kioto::detail::async_read_some_t>;
         template<typename IoOp>
         static constexpr bool supports = supported_io_ops::template contains<IoOp>;
         template<typename IoOp>
         using io_state = mock_state_base<IoOp>;
 
         // ---- executor-facing contract ----
-        auto poll(coio::detail::ready_queue& ready, std::size_t) -> void {
+        auto poll(kioto::detail::ready_queue& ready, std::size_t) -> void {
             {
                 std::scoped_lock _{mtx_};
                 timers_.take_ready_timers(ready);
@@ -83,7 +83,7 @@ namespace {
         }
 
         // ---- timer capability (driven by the shared timer_scheduler mixin, like iocp_driver) ----
-        auto submit(coio::timer_driver::operation& op) -> void {
+        auto submit(kioto::timer_driver::operation& op) -> void {
             bool became_earliest = false;
             {
                 std::scoped_lock _{mtx_};
@@ -91,29 +91,29 @@ namespace {
             }
             if (became_earliest) wake_up();
         }
-        auto remove(coio::timer_driver::operation& op) -> bool {
+        auto remove(kioto::timer_driver::operation& op) -> bool {
             std::scoped_lock _{mtx_};
             return timers_.remove(op);
         }
 
     private:
-        coio::detail::ready_queue completed_{&coio::detail::operation_base::next_};
+        kioto::detail::ready_queue completed_{&kioto::detail::operation_base::next_};
         std::mutex mtx_;
-        coio::detail::timer_queue<
-            coio::timer_driver::operation, &coio::timer_driver::operation::deadline,
-            &coio::timer_driver::operation::heap_index, std::pmr::polymorphic_allocator<>> timers_{std::pmr::polymorphic_allocator<>{}};
+        kioto::detail::timer_queue<
+            kioto::timer_driver::operation, &kioto::timer_driver::operation::deadline,
+            &kioto::timer_driver::operation::heap_index, std::pmr::polymorphic_allocator<>> timers_{std::pmr::polymorphic_allocator<>{}};
         std::counting_semaphore<> sema_{0};
     };
 
     template<typename IoOp>
     class mock_state_base {
-        static_assert(coio::always_false<IoOp>, "this operation isn't supported");
+        static_assert(kioto::always_false<IoOp>, "this operation isn't supported");
     };
 
     template<>
-    class mock_state_base<coio::detail::async_read_some_t> : public mock_node {
+    class mock_state_base<kioto::detail::async_read_some_t> : public mock_node {
     public:
-        mock_state_base(mock_driver& driver, mock_driver::io_ref ref, coio::detail::async_read_some_t) noexcept
+        mock_state_base(mock_driver& driver, mock_driver::io_ref ref, kioto::detail::async_read_some_t) noexcept
             : driver_(driver), ref_(ref) {}
 
     protected:
@@ -136,7 +136,7 @@ namespace {
         }
         static auto on_finish() noexcept -> void {}
 
-        coio::async_result<coio::execution::set_value_t(std::size_t), coio::execution::set_error_t(std::error_code)> result;
+        kioto::async_result<kioto::execution::set_value_t(std::size_t), kioto::execution::set_error_t(std::error_code)> result;
 
     private:
         mock_driver& driver_;
@@ -146,7 +146,7 @@ namespace {
     template<typename Executor, typename Base>
     class mock_scheduler : public Base {
     public:
-        using scheduler_concept = coio::detail::io_scheduler_tag;
+        using scheduler_concept = kioto::detail::io_scheduler_tag;
         using Base::Base;
 
         class io_handle {
@@ -167,24 +167,24 @@ namespace {
 
         template<typename IoOp>
         [[nodiscard]] auto schedule_io(io_handle& obj, IoOp op) const noexcept {
-            return coio::detail::schedule_io(*this->ctx_, obj.ref(), std::move(op));
+            return kioto::detail::schedule_io(*this->ctx_, obj.ref(), std::move(op));
         }
     };
 
-    using mock_context = coio::executor<mock_driver>;
+    using mock_context = kioto::executor<mock_driver>;
 }
 
 TEST_CASE("a completion-model driver with heap timers composes and completes through the generic io machinery") {
-    static_assert(mock_context::has_capability<coio::capability::io>);
-    static_assert(mock_context::has_capability<coio::capability::timer>);
-    static_assert(coio::timed_scheduler<mock_context::scheduler>);     // schedule_after inherited from the timer mixin
-    static_assert(mock_driver::supports<coio::detail::async_read_some_t>);
-    static_assert(not mock_driver::supports<coio::detail::async_connect_t>);
+    static_assert(mock_context::has_capability<kioto::capability::io>);
+    static_assert(mock_context::has_capability<kioto::capability::timer>);
+    static_assert(kioto::timed_scheduler<mock_context::scheduler>);     // schedule_after inherited from the timer mixin
+    static_assert(mock_driver::supports<kioto::detail::async_read_some_t>);
+    static_assert(not mock_driver::supports<kioto::detail::async_connect_t>);
 
     mock_context ctx;
     auto sched = ctx.get_scheduler();
-    coio::async_scope scope;
-    std::optional<coio::work_guard<mock_context>> guard{std::in_place, ctx};
+    kioto::async_scope scope;
+    std::optional<kioto::work_guard<mock_context>> guard{std::in_place, ctx};
 
     std::jthread driver{[&ctx] { ctx.run(); }};
 
@@ -196,21 +196,21 @@ TEST_CASE("a completion-model driver with heap timers composes and completes thr
     auto bad = sched.make_io_handle(-1);
 
     // Async path: do_start parks the op; poll reaps it and complete() delivers 42.
-    scope.spawn_on(sched, sched.schedule_io(good, coio::detail::async_read_some_t{})
-        | coio::then([&](std::size_t n) { io_result.store(n, std::memory_order_relaxed); }));
+    scope.spawn_on(sched, sched.schedule_io(good, kioto::detail::async_read_some_t{})
+        | kioto::then([&](std::size_t n) { io_result.store(n, std::memory_order_relaxed); }));
     // Sync-failure path: do_start returns false with the error set; operation_state posts the finish.
-    scope.spawn_on(sched, sched.schedule_io(bad, coio::detail::async_read_some_t{})
-        | coio::then([](std::size_t) noexcept {})
-        | coio::upon_error([&](auto&& error) {
+    scope.spawn_on(sched, sched.schedule_io(bad, kioto::detail::async_read_some_t{})
+        | kioto::then([](std::size_t) noexcept {})
+        | kioto::upon_error([&](auto&& error) {
               if constexpr (std::same_as<std::decay_t<decltype(error)>, std::error_code>)
                   sync_error.store(true, std::memory_order_relaxed);
           }));
     // Timer path: schedule_after rides the driver's heap and bounds poll_wait.
     scope.spawn_on(sched, sched.schedule_after(std::chrono::milliseconds{1})
-        | coio::then([&] { timer_fired.store(true, std::memory_order_relaxed); }));
+        | kioto::then([&] { timer_fired.store(true, std::memory_order_relaxed); }));
 
     guard.reset();
-    coio::this_thread::sync_wait(scope.join());
+    kioto::this_thread::sync_wait(scope.join());
     ctx.request_stop();
     driver.join();
 

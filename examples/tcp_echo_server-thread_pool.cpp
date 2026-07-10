@@ -1,20 +1,20 @@
-#include <coio/core.h>
-#include <coio/asyncio/io.h>
-#include <coio/net/socket.h>
-#include <coio/net/tcp.h>
-#include <coio/utils/signal_wait.h>
+#include <kioto/core.h>
+#include <kioto/io/io.h>
+#include <kioto/net/socket.h>
+#include <kioto/net/tcp.h>
+#include <kioto/base/signal_wait.h>
 #include "common.h"
 
-#if COIO_OS_LINUX
-#include <coio/asyncio/epoll_context.h>
-using io_context = coio::epoll_context;
-#elif COIO_OS_WINDOWS
-#include <coio/asyncio/iocp_context.h>
-using io_context = coio::iocp_context;
+#if KIOTO_OS_LINUX
+#include <kioto/io/driver/epoll_context.h>
+using io_context = kioto::epoll_context;
+#elif KIOTO_OS_WINDOWS
+#include <kioto/io/driver/iocp_context.h>
+using io_context = kioto::iocp_context;
 #endif
 
-using tcp_socket = coio::tcp::socket<io_context::scheduler>;
-using tcp_acceptor = coio::tcp::acceptor<io_context::scheduler>;
+using tcp_socket = kioto::tcp::socket<io_context::scheduler>;
+using tcp_acceptor = kioto::tcp::acceptor<io_context::scheduler>;
 
 class thread_pool {
 public:
@@ -54,7 +54,7 @@ public:
 private:
     io_context context_;
     std::vector<std::thread> threads_;
-    std::vector<coio::work_guard<io_context>> work_guards_;
+    std::vector<kioto::work_guard<io_context>> work_guards_;
 };
 
 auto handle_connection(tcp_socket socket) -> io_context::task<> {
@@ -63,8 +63,8 @@ auto handle_connection(tcp_socket socket) -> io_context::task<> {
     try {
         char buffer[1024];
         while (true) {
-            const auto length = co_await socket.async_read_some(coio::as_writable_bytes(buffer));
-            co_await (coio::async_write(socket, coio::as_bytes(buffer, length)) | as_throwing);
+            const auto length = co_await socket.async_read_some(kioto::as_writable_bytes(buffer));
+            co_await (kioto::async_write(socket, kioto::as_bytes(buffer, length)) | as_throwing);
         }
     }
     catch (const std::system_error& e) {
@@ -72,9 +72,9 @@ auto handle_connection(tcp_socket socket) -> io_context::task<> {
     }
 }
 
-auto start_server(coio::async_scope& scope) -> io_context::task<> try {
-    io_context::scheduler sched = co_await coio::read_scheduler();
-    tcp_acceptor acceptor{sched, coio::endpoint{coio::ipv4_address::any(), 8086}};
+auto start_server(kioto::async_scope& scope) -> io_context::task<> try {
+    io_context::scheduler sched = co_await kioto::read_scheduler();
+    tcp_acceptor acceptor{sched, kioto::endpoint{kioto::ipv4_address::any(), 8086}};
     ::debug("server \"{}\" start...", acceptor.local_endpoint());
     while (true) {
         scope.spawn_on(sched, handle_connection(co_await acceptor.async_accept()));
@@ -84,17 +84,17 @@ catch (const std::system_error& e) {
     ::debug("acceptor error: {}", e.what());
 }
 
-auto signal_watchdog(thread_pool& pool) -> coio::inline_task<> {
-    const int signum = co_await coio::signal_wait(SIGINT, SIGTERM);
-    ::debug("server stop with signal: ({}){}", signum, coio::strsignal(signum));
+auto signal_watchdog(thread_pool& pool) -> kioto::inline_task<> {
+    const int signum = co_await kioto::signal_wait(SIGINT, SIGTERM);
+    ::debug("server stop with signal: ({}){}", signum, kioto::strsignal(signum));
     pool.stop();
 }
 
 auto main() -> int {
     using namespace std::chrono_literals;
     thread_pool pool{4};
-    coio::async_scope scope;
+    kioto::async_scope scope;
     scope.spawn(signal_watchdog(pool));
     scope.spawn_on(pool.get_scheduler(), start_server(scope));
-    coio::this_thread::sync_wait(scope.join());
+    kioto::this_thread::sync_wait(scope.join());
 }

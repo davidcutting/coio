@@ -16,16 +16,16 @@
 #include <set>
 #include <utility>
 #include <benchmark/benchmark.h>
-#include <coio/core.h>
-#include <coio/asyncio/uring_context.h>
-#include <coio/metrics.h>
-#include <coio/metrics_reporter.h>
-#include <coio/runtime.h>
+#include <kioto/core.h>
+#include <kioto/io/driver/uring_context.h>
+#include <kioto/runtime/metrics.h>
+#include <kioto/runtime/metrics_reporter.h>
+#include <kioto/runtime/runtime.h>
 
 namespace {
     // A uring worker with the counting metrics policy plugged in (vs. uring_context = no_metrics).
-    using metered_uring = coio::basic_executor<coio::counting_metrics, coio::uring_driver>;
-    using metered_runtime = coio::basic_runtime<metered_uring>;
+    using metered_uring = kioto::basic_executor<kioto::counting_metrics, kioto::uring_driver>;
+    using metered_runtime = kioto::basic_runtime<metered_uring>;
 
     auto make_runtime(std::size_t workers, std::size_t entries) {
         return std::optional<metered_runtime>{
@@ -37,7 +37,7 @@ namespace {
     auto us(std::chrono::nanoseconds d) -> double { return std::chrono::duration<double, std::micro>(d).count(); }
 
     // Feed the whole-run report into the benchmark's counters + print the breakdown (once per config).
-    auto record(benchmark::State& state, const coio::runtime_report& rep, const char* tag, std::size_t workers) -> void {
+    auto record(benchmark::State& state, const kioto::runtime_report& rep, const char* tag, std::size_t workers) -> void {
         const auto& a = rep.aggregate_rates;
         state.counters["ops/s"]      = benchmark::Counter(a.ops_per_sec);
         state.counters["util"]       = benchmark::Counter(a.utilization);
@@ -71,14 +71,14 @@ namespace {
         for (auto _ : state) {
             state.PauseTiming();
             auto rt = make_runtime(workers, 256);
-            coio::runtime_report rep;
+            kioto::runtime_report rep;
             {
-                coio::metrics_reporter reporter{*rt};   // baseline
+                kioto::metrics_reporter reporter{*rt};   // baseline
                 reporter.probe_scheduling(std::chrono::microseconds{100});
                 state.ResumeTiming();
 
-                for (long i = 0; i < tasks; ++i) rt->spawn(coio::just());
-                coio::this_thread::sync_wait(rt->join());
+                for (long i = 0; i < tasks; ++i) rt->spawn(kioto::just());
+                kioto::this_thread::sync_wait(rt->join());
 
                 state.PauseTiming();
                 rep = reporter.tick();
@@ -100,19 +100,19 @@ namespace {
         for (auto _ : state) {
             state.PauseTiming();
             auto rt = make_runtime(workers, 256);
-            coio::runtime_report rep;
+            kioto::runtime_report rep;
             {
-                coio::metrics_reporter reporter{*rt};   // baseline
+                kioto::metrics_reporter reporter{*rt};   // baseline
                 reporter.probe_scheduling(std::chrono::microseconds{100});
                 state.ResumeTiming();
 
                 for (std::size_t w = 0; w < workers; ++w) {
-                    rt->spawn(coio::just() | coio::let_value([rt = &*rt, per] {
-                        for (long i = 0; i < per; ++i) rt->spawn(coio::just());
-                        return coio::just();
+                    rt->spawn(kioto::just() | kioto::let_value([rt = &*rt, per] {
+                        for (long i = 0; i < per; ++i) rt->spawn(kioto::just());
+                        return kioto::just();
                     }));
                 }
-                coio::this_thread::sync_wait(rt->join());
+                kioto::this_thread::sync_wait(rt->join());
 
                 state.PauseTiming();
                 rep = reporter.tick();

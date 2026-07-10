@@ -1,0 +1,72 @@
+﻿#pragma once
+#include <kioto/exec/execution.h>
+
+namespace kioto {
+    class async_scope {
+    public:
+        using token = execution::counting_scope::token;
+
+    public:
+        async_scope() = default;
+
+        async_scope(const async_scope&) = delete;
+
+        ~async_scope() = default;
+
+        auto operator= (const async_scope&) -> async_scope& = delete;
+
+        [[nodiscard]]
+        KIOTO_ALWAYS_INLINE auto join() noexcept {
+            return impl_.join();
+        }
+
+        [[nodiscard]]
+        KIOTO_ALWAYS_INLINE auto get_token() noexcept -> token {
+            return impl_.get_token();
+        }
+
+        KIOTO_ALWAYS_INLINE auto request_stop() noexcept -> void {
+            impl_.request_stop();
+        }
+
+        KIOTO_ALWAYS_INLINE auto close() noexcept -> void {
+            impl_.close();
+        }
+
+        KIOTO_ALWAYS_INLINE auto spawn(execution::sender auto sndr) noexcept -> void {
+            execution::spawn(execution::upon_error(std::move(sndr), terminate_on_error), get_token());
+        }
+
+        KIOTO_ALWAYS_INLINE auto spawn_on(execution::scheduler auto sched, execution::sender auto sndr) noexcept -> void {
+            execution::spawn(
+                execution::starts_on(sched, execution::upon_error(std::move(sndr), terminate_on_error)),
+                get_token(),
+                execution::prop{get_allocator, detail::get_suitable_allocator(sched)}
+            );
+        }
+
+        [[nodiscard]]
+        KIOTO_ALWAYS_INLINE auto spawn_future(execution::sender auto sndr) noexcept {
+            return execution::spawn_future(execution::upon_error(std::move(sndr), terminate_on_error), get_token());
+        }
+
+        [[nodiscard]]
+        KIOTO_ALWAYS_INLINE auto spawn_future_on(execution::scheduler auto sched, execution::sender auto sndr) noexcept {
+            return execution::spawn_future(
+                execution::starts_on(sched, execution::upon_error(std::move(sndr), terminate_on_error)),
+                get_token(),
+                execution::prop{get_allocator, detail::get_suitable_allocator(sched)}
+            );
+        }
+
+    public:
+        static constexpr std::size_t max_associations = execution::counting_scope::max_associations;
+
+    private:
+        static constexpr auto terminate_on_error = [](const auto&...) noexcept {
+            std::terminate();
+        };
+
+        execution::counting_scope impl_;
+    };
+}

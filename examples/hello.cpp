@@ -1,24 +1,24 @@
-#include <coio/core.h>
-#include <coio/execution_context.h>
-#include <coio/utils/timer.h>
+#include <kioto/core.h>
+#include <kioto/io/execution_context.h>
+#include <kioto/base/timer.h>
 #include "common.h"
 
 using namespace std::chrono_literals;
 
-auto job(coio::time_loop::scheduler sched, std::string_view name, int value, std::chrono::seconds timeout) -> coio::task<int> {
-    coio::timer timer{sched};
+auto job(kioto::time_loop::scheduler sched, std::string_view name, int value, std::chrono::seconds timeout) -> kioto::task<int> {
+    kioto::timer timer{sched};
     co_await timer.async_wait(timeout);
     ::println("{} completed", name);
     co_return value;
 }
 
 auto main() -> int {
-    coio::time_loop context;
+    kioto::time_loop context;
     const auto tick = std::chrono::steady_clock::now();
-    auto [i, j] = coio::this_thread::sync_wait(coio::when_all(
+    auto [i, j] = kioto::this_thread::sync_wait(kioto::when_all(
         job(context.get_scheduler(), "foo", 114, 2s),
         job(context.get_scheduler(), "bar", 514, 1s),
-        [&context]() -> coio::task<> {
+        [&context]() -> kioto::task<> {
             context.run();
             co_return;
         }()

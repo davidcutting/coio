@@ -1,4 +1,4 @@
-# coio
+# kioto
 
 ---
 
@@ -34,12 +34,12 @@ A C++ **asynchronous I/O** library based on [sender/receiver model](https://wg21
 - CMake 3.26+
 
 ### Build Options
-- `COIO_BUILD_EXAMPLES` (`ON`/`OFF`, default `OFF`) - Build example programs
-- `COIO_BUILD_TESTS` (`ON/OFF`, default `OFF`) - Build [**doctest**](https://github.com/doctest/doctest)-based tests
-- `COIO_BUILD_WITH_ASAN` (`ON`/`OFF`, default `OFF`) - Whether to enable **AddressSanitizer**
-- `COIO_BUILD_WITH_TSAN` (`ON`/`OFF`, default `OFF`) - Whether to enable **ThreadSanitizer**
-- `COIO_BUILD_WITH_UBSAN` (`ON`/`OFF`, default `OFF`) - Whether to enable **UndefinedBehaviorSanitizer**
-- `COIO_SENDERS_BACKEND` (`NVIDIA`/`BEMAN`/`CXX26`, default `NVIDIA`) - Which **std::execution** implementation to use:
+- `KIOTO_BUILD_EXAMPLES` (`ON`/`OFF`, default `OFF`) - Build example programs
+- `KIOTO_BUILD_TESTS` (`ON/OFF`, default `OFF`) - Build [**doctest**](https://github.com/doctest/doctest)-based tests
+- `KIOTO_BUILD_WITH_ASAN` (`ON`/`OFF`, default `OFF`) - Whether to enable **AddressSanitizer**
+- `KIOTO_BUILD_WITH_TSAN` (`ON`/`OFF`, default `OFF`) - Whether to enable **ThreadSanitizer**
+- `KIOTO_BUILD_WITH_UBSAN` (`ON`/`OFF`, default `OFF`) - Whether to enable **UndefinedBehaviorSanitizer**
+- `KIOTO_SENDERS_BACKEND` (`NVIDIA`/`BEMAN`/`CXX26`, default `NVIDIA`) - Which **std::execution** implementation to use:
   - `NVIDIA` - [NVIDIA/stdexec](https://github.com/NVIDIA/stdexec) implementation
   - `BEMAN` - [bemanproject/execution](https://github.com/bemanproject/execution) implementation  
   - `CXX26` - Standard library implementation
@@ -57,13 +57,13 @@ cmake --build <build directory>
 
 ### Build with Examples
 ```shell
-cmake -S . -B <build directory> -DCOIO_BUILD_EXAMPLES=ON
+cmake -S . -B <build directory> -DKIOTO_BUILD_EXAMPLES=ON
 cmake --build <build directory>
 ```
 
 ### Build and Run Tests
 ```shell
-cmake -S . -B <build directory> -DCOIO_BUILD_TESTS=ON
+cmake -S . -B <build directory> -DKIOTO_BUILD_TESTS=ON
 cmake --build <build directory>
 ctest --test-dir <build directory>
 ```
@@ -74,23 +74,23 @@ cmake --install <build directory> --prefix <install directory>
 ```
 
 ### CMake Usage
-If coio is already installed, you can import it as follows:
+If kioto is already installed, you can import it as follows:
 ```cmake
-find_package(coio REQUIRED)
-target_link_libraries(<your-target> coio::coio)
+find_package(kioto REQUIRED)
+target_link_libraries(<your-target> kioto::kioto)
 ```
 However, it is highly recommended to use [CPM](https://github.com/cpm-cmake/CPM.cmake):
 ```cmake
 CPMFindPackage(
-    NAME coio
-    GITHUB_REPOSITORY Cra3z/coio
+    NAME kioto
+    GITHUB_REPOSITORY Cra3z/kioto
     GIT_TAG main
     EXCLUDE_FROM_ALL YES
     SYSTEM YES
     OPTIONS
-    "COIO_BUILD_EXAMPLES OFF"
+    "KIOTO_BUILD_EXAMPLES OFF"
 )
-target_link_libraries(<your-target> coio::coio)
+target_link_libraries(<your-target> kioto::kioto)
 ```
 
 ### Usage & Document

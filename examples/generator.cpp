@@ -1,9 +1,9 @@
 #include <array>
 #include <memory_resource>
-#include <coio/generator.h>
+#include <kioto/exec/generator.h>
 #include "common.h"
 
-auto fibonacci(std::size_t n) -> coio::generator<int> {
+auto fibonacci(std::size_t n) -> kioto::generator<int> {
     int a = 0, b = 1;
     while (n--) {
         co_yield b;
@@ -11,21 +11,21 @@ auto fibonacci(std::size_t n) -> coio::generator<int> {
     }
 }
 
-auto iota(int n) -> coio::generator<int> {
+auto iota(int n) -> kioto::generator<int> {
     for (int i = 0; i < n; ++i) co_yield i;
 }
 
 template<typename T>
 struct Node {
-    auto traverse_inorder() const -> coio::generator<const T&> {
+    auto traverse_inorder() const -> kioto::generator<const T&> {
         if (left) {
-            co_yield coio::elements_of{left->traverse_inorder()};
+            co_yield kioto::elements_of{left->traverse_inorder()};
         }
 
         co_yield value;
 
         if (right) {
-            co_yield coio::elements_of{right->traverse_inorder()};
+            co_yield kioto::elements_of{right->traverse_inorder()};
         }
     }
 

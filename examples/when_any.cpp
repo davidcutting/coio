@@ -1,10 +1,10 @@
-#include <coio/core.h>
-#include <coio/execution_context.h>
-#include <coio/utils/timer.h>
+#include <kioto/core.h>
+#include <kioto/io/execution_context.h>
+#include <kioto/base/timer.h>
 #include "common.h"
 
-auto job(coio::time_loop::scheduler sched, std::string_view name, int value, std::chrono::seconds timeout) -> coio::task<int> {
-    coio::timer timer{sched};
+auto job(kioto::time_loop::scheduler sched, std::string_view name, int value, std::chrono::seconds timeout) -> kioto::task<int> {
+    kioto::timer timer{sched};
     co_await timer.async_wait(timeout);
     ::println("{} completed", name);
     co_return value;
@@ -12,13 +12,13 @@ auto job(coio::time_loop::scheduler sched, std::string_view name, int value, std
 
 auto main() -> int {
     using namespace std::chrono_literals;
-    coio::time_loop context;
+    kioto::time_loop context;
     const auto tick = std::chrono::steady_clock::now();
-    auto value = coio::this_thread::sync_wait_with_variant(coio::when_any(
-        coio::starts_on(context.get_scheduler(), job(context.get_scheduler(), "foo", 114, 2s)),
-        coio::starts_on(context.get_scheduler(), job(context.get_scheduler(), "bar", 514, 1s)),
-        coio::starts_on(context.get_scheduler(), job(context.get_scheduler(), "qux", 1919, 3s)),
-        [&context]() -> coio::task<> {
+    auto value = kioto::this_thread::sync_wait_with_variant(kioto::when_any(
+        kioto::starts_on(context.get_scheduler(), job(context.get_scheduler(), "foo", 114, 2s)),
+        kioto::starts_on(context.get_scheduler(), job(context.get_scheduler(), "bar", 514, 1s)),
+        kioto::starts_on(context.get_scheduler(), job(context.get_scheduler(), "qux", 1919, 3s)),
+        [&context]() -> kioto::task<> {
             context.run();
             co_return;
         }()

@@ -1,11 +1,11 @@
 #include <string>
 #include <vector>
 #include <doctest/doctest.h>
-#include <coio/core.h>
-#include <coio/utils/fifo.h>
+#include <kioto/core.h>
+#include <kioto/base/fifo.h>
 
 TEST_CASE("fifo preserves order with try operations") {
-    coio::fifo<std::string> queue;
+    kioto::fifo<std::string> queue;
 
     CHECK(queue.empty());
     CHECK(queue.try_push("one"));
@@ -24,17 +24,17 @@ TEST_CASE("fifo preserves order with try operations") {
 }
 
 TEST_CASE("fifo hands off values between async producers and consumers") {
-    coio::fifo<std::string> queue;
+    kioto::fifo<std::string> queue;
     std::vector<std::string> popped;
     popped.reserve(3);
 
-    coio::this_thread::sync_wait(coio::when_all(
-        [&]() -> coio::task<> {
+    kioto::this_thread::sync_wait(kioto::when_all(
+        [&]() -> kioto::task<> {
             popped.push_back(co_await queue.async_pop());
             popped.push_back(co_await queue.async_pop());
             popped.push_back(co_await queue.async_pop());
         }(),
-        [&]() -> coio::task<> {
+        [&]() -> kioto::task<> {
             co_await queue.async_push("one");
             co_await queue.async_push("two");
             co_await queue.async_push("three");

@@ -1,10 +1,10 @@
 // ReSharper disable CppMemberFunctionMayBeConst
 #include <kioto/base/config.h>
 #if KIOTO_HAS_IOCP
-#include <WinSock2.h>
-#include <WS2tcpip.h>
-#include <MSWSock.h>
-#include <Windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mswsock.h>
+#include <windows.h>
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -826,7 +826,7 @@ namespace kioto {
                     ::sockaddr_in addr4 = {
                         .sin_family = AF_INET,
                         .sin_port = 0,
-                        .sin_addr = in4addr_any
+                        .sin_addr = in_addr{} /* INADDR_ANY; in4addr_any is MSVC-SDK-only */
                     };
                     if (::bind(sock, reinterpret_cast<::sockaddr*>(&addr4), sizeof(addr4)) == SOCKET_ERROR) {
                         err = static_cast<::DWORD>(::WSAGetLastError());

@@ -1,8 +1,12 @@
 #pragma once
-#include <WinSock2.h>
-#include <WS2tcpip.h>
-#include <MSWSock.h> // IWYU pragma: keep
-#include <Windows.h>
+// Select a modern Windows API level before winsock so modern symbols are declared
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00 // Windows 10
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mswsock.h> // IWYU pragma: keep
+#include <windows.h>
 #include <system_error>
 #include <variant>
 #include <kioto/base/error.h> // IWYU pragma: keep

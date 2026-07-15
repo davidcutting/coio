@@ -7,7 +7,7 @@
 #endif
 
 #include <basetsd.h>
-#include <WinSock2.h>
+#include <winsock2.h>
 #include <bit>
 #include <chrono>
 #include <concepts>

@@ -1,4 +1,5 @@
 #include <bit>
+#include <cstring>
 #include <variant>
 #include <kioto/base/basic.h>
 #include <kioto/base/error.h>
